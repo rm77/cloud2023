@@ -1,0 +1,16 @@
+
+
+untuk membuka isi dari hello-rootfs.ext4
+
+sudo mkdir -p /tmp/myrootfs
+sudo mount -t ext4 -o loop hello-rootfs.ext4 /tmp/myrootfs
+
+
+untuk generate key
+ssh-keygen -f kunci
+akan menghasilkan kunci.pub (public) dan kunci (private)
+
+
+inject kunci pub ke authorized_keys
+sudo cat kunci.pub >> /tmp/myrootfs/root/.ssh/authorized_keys
+
