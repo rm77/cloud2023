@@ -18,6 +18,7 @@ services:
       - "GRANT_SUDO=yes"
     volumes:
       - ./workmesin1:/home/jovyan/work
+      - /dev/kvm:/dev/kvm
     networks:
     - ssnet
   mesin2:
@@ -33,6 +34,7 @@ services:
       - "GRANT_SUDO=yes"
     volumes:
       - ./workmesin2:/home/jovyan/work
+      - /dev/kvm:/dev/kvm
     networks:
     - ssnet
   mesin3:
@@ -48,6 +50,7 @@ services:
       - "GRANT_SUDO=yes"
     volumes:
       - ./workmesin3:/home/jovyan/work
+      - /dev/kvm:/dev/kvm
     networks:
     - ssnet
 
