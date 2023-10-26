@@ -1,6 +1,8 @@
 arsitektur FC 
 https://image.slidesharecdn.com/firecracker-secure-and-fast-m-2dcda461-b212-4eaa-b420-61cf12d543d0-202338183-190701222732/75/firecracker-secure-and-fast-microvms-for-serverless-computing-sep316-aws-reinforce-2019-9-2048.jpg?cb=1667625441
 
+https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md
+
 rest api
 https://image.slidesharecdn.com/firecracker-secure-and-fast-m-2dcda461-b212-4eaa-b420-61cf12d543d0-202338183-190701222732/75/firecracker-secure-and-fast-microvms-for-serverless-computing-sep316-aws-reinforce-2019-8-2048.jpg?cb=1667625441
 
