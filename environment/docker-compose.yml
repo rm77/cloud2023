@@ -1,57 +1,30 @@
 version: '2'
-networks:
-    ssnet:
-       ipam:
-         config:
-         - subnet: 172.200.211.0/24
 services:
   mesin1:
-    container_name: mesin-1
-    image: royyana/rm-jupyter-go:1.00
+    network_mode: 'host'
+    privileged: true
+    container_name: mesin1
+    image: royyana/vmdev:2.00
     user: root
-    ports:
-      - "60001:8888"
-      - "20001:20000"
     environment:
-      - "PASSWORD=mesin1"
-      - "DOCKER_STACKS_JUPYTER_CMD=lab"
-      - "GRANT_SUDO=yes"
+      - "AUTH=user1:mesin1"
+    cap_add:
+      - ALL
+      - SYS_RAWIO
+    devices:
+      - "/dev/kvm:/dev/kvm"
+      - "/dev/pts:/dev/pts"
+      - "/dev/mem:/dev/mem"
+      - "/dev/shm:/dev/shm"
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
       - ./workmesin1:/home/jovyan/work
       - /dev/kvm:/dev/kvm
-    networks:
-    - ssnet
-  mesin2:
-    container_name: mesin-2
-    image: royyana/rm-jupyter-go:1.00
-    user: root
-    ports:
-      - "60002:8888"
-      - "20002:20000"
-    environment:
-      - "PASSWORD=mesin2"
-      - "DOCKER_STACKS_JUPYTER_CMD=lab"
-      - "GRANT_SUDO=yes"
-    volumes:
-      - ./workmesin2:/home/jovyan/work
-      - /dev/kvm:/dev/kvm
-    networks:
-    - ssnet
-  mesin3:
-    container_name: mesin-3
-    image: royyana/rm-jupyter-go:1.00
-    user: root
-    ports:
-      - "60003:8888"
-      - "20003:20000"
-    environment:
-      - "PASSWORD=mesin3"
-      - "DOCKER_STACKS_JUPYTER_CMD=lab"
-      - "GRANT_SUDO=yes"
-    volumes:
-      - ./workmesin3:/home/jovyan/work
-      - /dev/kvm:/dev/kvm
-    networks:
-    - ssnet
+      - /dev/shm:/dev/shm
+      - /dev/pts:/dev/pts
+      - ./script:/script:rw
+      - ./work:/home/work
+    entrypoint: /bin/sh /script/entrypoint.sh
 
 
