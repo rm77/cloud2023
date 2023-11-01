@@ -1,0 +1,7 @@
+contoh cloud images
+
+https://cloud-images.ubuntu.com/releases/groovy/release-20210720/ubuntu-20.10-server-cloudimg-amd64.img
+
+
+download dengan:
+curl -Lo cloud-image.img https://cloud-images.ubuntu.com/releases/groovy/release-20210720/ubuntu-20.10-server-cloudimg-amd64.img
