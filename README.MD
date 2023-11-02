@@ -1,4 +1,5 @@
 **Environment**
+
 disediakan 1 buah mesin dengan web based terminal
 - mesin-1
 
@@ -8,6 +9,10 @@ untuk menjalankan dibutuhkan
 - docker-compose
 - docker image royyana/vmdev:2.00
 
+
+> [!NOTE]
+> royyana/vmdev:2.00 merupakan docker image yang telah dilengkapi dengan berbagai macam tool yang ready to use untuk keperluan MK komputasi awan
+> berisi diantaranya adalah qemu, ip, firecracker, kubectl, docker, docker-compose 
 
 menjalankan lab
 ```
