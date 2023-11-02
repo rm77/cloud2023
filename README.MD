@@ -22,9 +22,10 @@ docker-compose up -d
 webbased terminal dapat diakses di 
 - mesin1 http://[ipaddress]:10001 username:user1 password:mesin1
 
-lokasi penting
-- work --> /home/work
-- script ---> /script/
+
+> [!NOTE] Lokasi penting didalam container
+> work --> /home/work
+> script ---> /script/
 
 untuk menghentikan lab
 ```
