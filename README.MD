@@ -19,11 +19,11 @@ menjalankan lab
 cd environment
 docker-compose up -d
 ```
-webbased terminal dapat diakses di 
-- mesin1 http://[ipaddress]:10001 username:user1 password:mesin1
 
-
-> [!NOTE] Lokasi penting didalam container
+> [!NOTE] 
+> Lokasi penting didalam container
+> webbased terminal dapat diakses di 
+> _http://[ipaddress]:10001_ dengan  username:user1 password:mesin1
 > work --> /home/work
 > script ---> /script/
 
