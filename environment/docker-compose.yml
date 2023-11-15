@@ -9,6 +9,7 @@ services:
     environment:
       - "AUTH=user1:mesin1"
       - "PATH=$PATH:/script"
+      - "TMUXCMD=attach -t mysession"
     cap_add:
       - ALL
       - SYS_RAWIO
