@@ -30,3 +30,17 @@ spec:
             name: coba-service
             port:
               number: 80
+      - pathType: ImplementationSpecific
+        path: /web1(/|$)(.*)
+        backend:
+          service:
+            name: web1-service
+            port:
+              number: 80
+      - pathType: ImplementationSpecific
+        path: /web2(/|$)(.*)
+        backend:
+          service:
+            name: web2-service
+            port:
+              number: 80
