@@ -1,4 +1,4 @@
-version: '2'
+version: '3'
 services:
   mesin1:
     network_mode: 'host'
@@ -8,6 +8,8 @@ services:
     user: root
     environment:
       - "AUTH=user1:mesin1"
+      - "PORTSSH=10022"
+      - "PORTTTYD=10000"
       - "PATH=$PATH:/script"
       - "TMUXCMD=attach -t mysession"
     cap_add:
