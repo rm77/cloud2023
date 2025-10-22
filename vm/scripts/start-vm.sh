@@ -7,8 +7,6 @@ VM_CPU=${VM_CPU:-2}
 
 cat <<EOF > /ops/user-data.cfg
 #cloud-config
-instance-id: ${VM_NAME}
-local-hostname: ${VM_NAME}
 hostname: host-${VM_NAME}
 manage_etc_hosts: false
 ssh_pwauth: true
@@ -19,13 +17,7 @@ users:
   shell: /bin/bash
   sudo: ALL=(ALL) NOPASSWD:ALL
   lock_passwd: false
-expire: false
-chpasswd:
-  list: |
-    root:kucinglucu
-    ubuntu:kucinglucu
-    royyana:kucinglucu
-  expire: false
+  plain_text_passwd: "kucinglucu"
 bootcmd:
 - uuidgen | md5sum | cut -d" " -f1 > /etc/machine-id
 EOF
