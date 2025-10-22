@@ -1,0 +1,51 @@
+#!/bin/bash
+
+VM_SIZE=${VM_SIZE:-2G}
+VM_NAME=${VM_NAME:-COBA1}
+VM_MEMORY=${VM_MEMORY:-2G}
+VM_CPU=${VM_CPU:-2}
+
+cat <<EOF > /ops/user-data.cfg
+#cloud-config
+instance-id: ${VM_NAME}
+local-hostname: ${VM_NAME}
+hostname: host-${VM_NAME}
+manage_etc_hosts: false
+ssh_pwauth: true
+disable_root: false
+users:
+- default
+- name: royyana
+  shell: /bin/bash
+  sudo: ALL=(ALL) NOPASSWD:ALL
+  lock_passwd: false
+expire: false
+chpasswd:
+  list: |
+    root:kucinglucu
+    ubuntu:kucinglucu
+    royyana:kucinglucu
+  expire: false
+bootcmd:
+- uuidgen | md5sum | cut -d" " -f1 > /etc/machine-id
+EOF
+
+#IMAGEFILE=${IMAGE}.qcow2
+#qemu-img convert -f qcow2 -O qcow2 ${IMAGE} ${IMAGEFILE}
+#qemu-img resize ${IMAGEFILE} ${VM_SIZE}
+#qemu-img info ${IMAGEFILE}
+
+
+rm -f /ops/cloud-init.iso
+cloud-localds -v -m local /ops/cloud-init.iso /ops/user-data.cfg 
+
+
+qemu-system-x86_64 \
+        -enable-kvm \
+        -name ${VM_NAME} \
+        -m ${VM_MEMORY} \
+        -smp ${VM_CPU} \
+        -drive file=${IMAGE},if=virtio \
+        -drive file=/ops/cloud-init.iso,media=cdrom,if=virtio \
+	-serial mon:stdio \
+        -pidfile /ops/${VM_NAME}.pid
