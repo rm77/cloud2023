@@ -1,9 +1,13 @@
 #!/bin/bash
 
+DOCKERNAME=vn1
 NETNAME=my_network
-docker network create $NETNAME 
-docker rm -f vn1
-docker run -d --name vn1 \
+SUBNET=172.16.254.0/24
+GATEWAY=172.16.254.1
+IPRANGE=172.16.254.20,172.16.254.25
+docker network create --driver=bridge --subnet=${SUBNET} --gateway=${GATEWAY} $NETNAME  
+docker rm -f $DOCKERNAME
+docker run -d --name $DOCKERNAME \
         --restart=always \
         --privileged \
         --cap-add=ALL \

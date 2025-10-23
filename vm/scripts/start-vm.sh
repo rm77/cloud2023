@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VM_SIZE=${VM_SIZE:-2G}
+VM_SIZE=${VM_SIZE:-5G}
 VM_NAME=${VM_NAME:-COBA1}
 VM_MEMORY=${VM_MEMORY:-2G}
 VM_CPU=${VM_CPU:-2}
@@ -22,7 +22,7 @@ bootcmd:
 - uuidgen | md5sum | cut -d" " -f1 > /etc/machine-id
 EOF
 
-#IMAGEFILE=${IMAGE}.qcow2
+IMAGEFILE=${IMAGE}.qcow2
 #qemu-img convert -f qcow2 -O qcow2 ${IMAGE} ${IMAGEFILE}
 #qemu-img resize ${IMAGEFILE} ${VM_SIZE}
 #qemu-img info ${IMAGEFILE}
@@ -40,4 +40,6 @@ qemu-system-x86_64 \
         -drive file=${IMAGE},if=virtio \
         -drive file=/ops/cloud-init.iso,media=cdrom,if=virtio \
 	-serial mon:stdio \
+	-netdev tap,id=interface0,ifname=tap0,script=/scripts/net-up.sh,downscript=/scripts/net-down.sh \
+	-device virtio-net-pci,netdev=interface0 \
         -pidfile /ops/${VM_NAME}.pid
