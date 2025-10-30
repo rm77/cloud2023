@@ -17,7 +17,14 @@ spec:
             port:
               number: 8080
       - pathType: ImplementationSpecific
-        path: /bar(/|$)(.*)
+        path: /counter(/|$)(.*)
+        backend:
+          service:
+            name: counter-service
+            port:
+              number: 8888
+      - pathType: ImplementationSpecific
+        path: /bar4(/|$)(.*)
         backend:
           service:
             name: bar-service
