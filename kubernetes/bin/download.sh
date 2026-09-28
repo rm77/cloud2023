@@ -9,6 +9,12 @@ curl -Lo ./kubectl  "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/re
 chmod a+x ./kubectl
 
 
+curl -Lo ./helm.tar.gz "https://get.helm.sh/helm-v4.3.0-linux-amd64.tar.gz"
+tar -xzvf helm.tar.gz
+mv linux-amd64/helm .
+rm -rf linux-amd64
+rm -f helm.tar.gz
+chmod +x ./helm
 export PATH=$PATH:$(pwd)
 
 
