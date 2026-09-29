@@ -1,6 +1,6 @@
-# Kind Sample Experiment App Bundle
+# App Sample
 
-This bundle creates and deploys a small Flask/Gunicorn application into an existing kind cluster.
+This creates and deploys a small Flask/Gunicorn application into an existing kind cluster.
 
 Default assumptions:
 
