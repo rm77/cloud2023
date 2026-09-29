@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: experiment-app
+  namespace: cloud-exp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: experiment-app
+  template:
+    metadata:
+      labels:
+        app: experiment-app
+    spec:
+      containers:
+      - name: app
+        image: experiment-app:v1
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "1"
+            memory: "512Mi"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: experiment-app
+  namespace: cloud-exp
+spec:
+  selector:
+    app: experiment-app
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: experiment-app
+  namespace: cloud-exp
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: experiment.10.28.84.254.sslip.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: experiment-app
+            port:
+              number: 80
