@@ -16,6 +16,8 @@ mv linux-amd64/helm .
 rm -rf linux-amd64
 rm -f helm.tar.gz
 chmod +x ./helm
+curl -Lo ./linkerd https://github.com/linkerd/linkerd2/releases/download/edge-26.9.3/linkerd2-cli-edge-26.9.3-linux-amd64
+chmod +x ./linkerd
 export PATH=$PATH:$(pwd)
 
 

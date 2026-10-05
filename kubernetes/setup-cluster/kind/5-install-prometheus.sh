@@ -1,11 +1,14 @@
 #!/bin/sh
 
+
+. ./variables.sh
+
 set -eu
 
 NAMESPACE="monitoring"
 RELEASE="monitoring"
 
-HOST_IP="10.28.84.254"
+HOST_IP="${HOST_IP:-127.0.0.1}"
 INGRESS_CLASS="nginx"
 
 PROM_HOST="prometheus.${HOST_IP}.sslip.io"
