@@ -387,6 +387,23 @@ spec:
     app.kubernetes.io/name: ingress-nginx
   type: ClusterIP
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress-nginx-controller-metrics
+  namespace: ingress-nginx
+  labels:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/component: controller
+spec:
+  selector:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/component: controller
+  ports:
+  - name: metrics
+    port: 10254
+    targetPort: 10254
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -425,6 +442,7 @@ spec:
         - --election-id=ingress-nginx-leader
         - --controller-class=k8s.io/ingress-nginx
         - --ingress-class=nginx
+        - --enable-metrics=true
         - --configmap=$(POD_NAMESPACE)/ingress-nginx-controller
         - --validating-webhook=:8443
         - --validating-webhook-certificate=/usr/local/certificates/cert
