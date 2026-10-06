@@ -143,6 +143,7 @@ echo "=== Ingress configuration ==="
 
 kubectl get ingress -n "${NAMESPACE}"
 kubectl apply -f prometheus-servicemonitor.yml 
+kubectl apply -f standard-install.yaml
 
 echo
 echo "=== DNS verification ==="
