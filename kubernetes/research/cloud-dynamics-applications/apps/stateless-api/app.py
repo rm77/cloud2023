@@ -2,7 +2,7 @@ from flask import Flask, jsonify
 import os, time
 app=Flask(__name__)
 @app.get("/")
-def index(): return jsonify(application="stateless-api", status="ok", ts=time.time())
+def index(): return jsonify(versi='0.0.2',application="stateless-api", status="ok", ts=time.time())
 @app.get("/health")
 def health(): return "ok\n"
 @app.get("/metrics")
