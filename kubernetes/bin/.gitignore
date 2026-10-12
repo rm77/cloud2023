@@ -2,3 +2,5 @@ kind
 kubectl
 rke
 helm
+linkerd
+
