@@ -142,8 +142,36 @@ echo
 echo "=== Ingress configuration ==="
 
 kubectl get ingress -n "${NAMESPACE}"
-kubectl apply -f prometheus-servicemonitor.yml 
-kubectl apply -f standard-install.yaml
+#kubectl apply -f prometheus-servicemonitor.yml 
+cat <<EOF | kubectl apply -f -
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ingress-nginx
+  namespace: monitoring
+  labels:
+    release: monitoring
+spec:
+  namespaceSelector:
+    matchNames:
+    - ingress-nginx
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ingress-nginx
+      app.kubernetes.io/component: controller
+
+  endpoints:
+  - port: metrics
+    path: /metrics
+    interval: 5s
+
+EOF
+
+
+
+
+
 
 echo
 echo "=== DNS verification ==="
