@@ -18,6 +18,10 @@ rm -f helm.tar.gz
 chmod +x ./helm
 curl -Lo ./linkerd https://github.com/linkerd/linkerd2/releases/download/edge-26.9.3/linkerd2-cli-edge-26.9.3-linux-amd64
 chmod +x ./linkerd
+
+curl -Lo ./k0s https://github.com/k0sproject/k0s/releases/download/v1.36.4%2Bk0s.1/k0s-v1.36.4+k0s.1-amd64
+chmod +x ./k0s
+
 export PATH=$PATH:$(pwd)
 
 

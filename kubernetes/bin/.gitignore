@@ -3,4 +3,5 @@ kubectl
 rke
 helm
 linkerd
+k0s
 
