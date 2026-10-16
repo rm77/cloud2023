@@ -82,6 +82,9 @@ OTEL_URL="http://${OTEL_HOST}"
 
 OTEL_WAIT_TIMEOUT="${OTEL_WAIT_TIMEOUT:-300s}"
 
+PROMETHEUS_URL="${PROMETHEUS_URL:-http://prometheus.${HOST_IP}.sslip.io:${INGRESS_HTTP_PORT}}"
+OTEL_URL="http://${OTEL_HOST}:${INGRESS_HTTP_PORT}"
+
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT INT TERM
 

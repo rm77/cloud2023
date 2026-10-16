@@ -50,4 +50,7 @@ GPU_NO_CGROUPS="${GPU_NO_CGROUPS:-no}"                         # yes = nvidia-co
 DEVICE_PLUGIN_VERSION="${DEVICE_PLUGIN_VERSION:-v0.19.2}"
 GPU_TEST_IMAGE="${GPU_TEST_IMAGE:-nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0}"
 
+INGRESS_HTTP_PORT="${INGRESS_HTTP_PORT:-28080}"
+INGRESS_HTTPS_PORT="${INGRESS_HTTPS_PORT:-28443}"
+
 . "${ROOT_DIR}/lib.sh"

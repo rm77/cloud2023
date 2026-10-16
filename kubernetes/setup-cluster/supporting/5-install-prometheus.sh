@@ -14,14 +14,16 @@ INGRESS_CLASS="nginx"
 PROM_HOST="prometheus.${HOST_IP}.sslip.io"
 GRAFANA_HOST="grafana.${HOST_IP}.sslip.io"
 
+PROM_URL="http://${PROM_HOST}:${INGRESS_HTTP_PORT}"
+GRAFANA_URL="http://${GRAFANA_HOST}:${INGRESS_HTTP_PORT}"
 
 echo "======================================"
 echo "Prometheus installation"
 echo "======================================"
 echo
 echo "Host IP        : ${HOST_IP}"
-echo "Prometheus URL : http://${PROM_HOST}"
-echo "Grafana URL    : http://${GRAFANA_HOST}"
+echo "Prometheus URL : http://${PROM_URL}"
+echo "Grafana URL    : http://${GRAFANA_URL}"
 echo
 
 

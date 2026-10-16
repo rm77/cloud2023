@@ -58,6 +58,10 @@ ALERTMANAGER_USER="${ALERTMANAGER_USER:-admin}"
 # Empty = generate a random password and print it at the end
 ALERTMANAGER_PASSWORD="${ALERTMANAGER_PASSWORD:-}"
 
+NETOBSERV_URL="http://${NETOBSERV_HOST}:${INGRESS_HTTP_PORT}"
+PROM_URL="${PROM_URL:-http://${PROM_HOST}:${INGRESS_HTTP_PORT}}"
+ALERTMANAGER_URL="http://${ALERTMANAGER_HOST}:${INGRESS_HTTP_PORT}"
+
 # ============================================================
 # PREFLIGHT
 # ============================================================

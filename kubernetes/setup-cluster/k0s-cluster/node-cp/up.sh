@@ -79,8 +79,8 @@ YAML
         -p "${GATEWAY_ADDR}:${API_PORT}:${API_PORT}" \
         -p "${GATEWAY_ADDR}:${JOIN_PORT}:${JOIN_PORT}" \
         -p "${GATEWAY_ADDR}:${KONNECTIVITY_PORT}:${KONNECTIVITY_PORT}" \
-	-p "0.0.0.0:80:80/tcp" \
-	-p "0.0.0.0:443:443/tcp"
+	-p "0.0.0.0:${INGRESS_HTTP_PORT}:80/tcp" \
+        -p "0.0.0.0:${INGRESS_HTTPS_PORT}:443/tcp"
 
     if [ -n "${NODE_MEMORY}" ]; then set -- "$@" --memory "${NODE_MEMORY}"; fi
     if [ -n "${NODE_CPUS}" ]; then set -- "$@" --cpus "${NODE_CPUS}"; fi
