@@ -105,5 +105,6 @@ for w in ${WORKER_NODES}; do
 done
 
 log "export KUBECONFIG=${CP_KUBECONFIG}"
-kc label node ${NODE_NAME} ingress-ready=true --overwrite
 kc get --raw='/version' | sed -n 's/.*"gitVersion": *"\([^"]*\)".*/kubernetes \1/p'
+wait_for "labeled" "${WAIT_TIMEOUT}" \
+   kc label node ${NODE_NAME} ingress-ready=true --overwrite
