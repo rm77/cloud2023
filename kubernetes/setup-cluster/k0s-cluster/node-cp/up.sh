@@ -5,6 +5,10 @@ set -eu
 cd "$(dirname "$0")"
 . ./variables.sh
 
+
+sudo sysctl -w fs.inotify.max_user_instances=512
+sudo sysctl -w fs.inotify.max_user_watches=524288
+
 # === Pre-flight ===
 require_tools
 resolve_gateway
@@ -74,10 +78,13 @@ YAML
         -p "127.0.0.1:${API_PORT}:${API_PORT}" \
         -p "${GATEWAY_ADDR}:${API_PORT}:${API_PORT}" \
         -p "${GATEWAY_ADDR}:${JOIN_PORT}:${JOIN_PORT}" \
-        -p "${GATEWAY_ADDR}:${KONNECTIVITY_PORT}:${KONNECTIVITY_PORT}"
+        -p "${GATEWAY_ADDR}:${KONNECTIVITY_PORT}:${KONNECTIVITY_PORT}" \
+	-p "0.0.0.0:80:80/tcp" \
+	-p "0.0.0.0:443:443/tcp"
+
     if [ -n "${NODE_MEMORY}" ]; then set -- "$@" --memory "${NODE_MEMORY}"; fi
     if [ -n "${NODE_CPUS}" ]; then set -- "$@" --cpus "${NODE_CPUS}"; fi
-    set -- "$@" "${K0S_NODE_IMAGE}" k0s controller --config=/etc/k0s/k0s.yaml
+    set -- "$@" "${K0S_NODE_IMAGE}" k0s controller --config=/etc/k0s/k0s.yaml --enable-worker --no-taints --profile=docker
     docker "$@" >/dev/null
     log "${CONTAINER_NAME} started"
 
@@ -98,4 +105,5 @@ for w in ${WORKER_NODES}; do
 done
 
 log "export KUBECONFIG=${CP_KUBECONFIG}"
+kc label node ${NODE_NAME} ingress-ready=true --overwrite
 kc get --raw='/version' | sed -n 's/.*"gitVersion": *"\([^"]*\)".*/kubernetes \1/p'

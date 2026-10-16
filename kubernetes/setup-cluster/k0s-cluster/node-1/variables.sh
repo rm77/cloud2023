@@ -11,7 +11,7 @@ CONTAINER_NAME="${CONTAINER_NAME:-${CONTAINER_PREFIX}${NODE_NAME}}"
 WORKER_LABELS="${WORKER_LABELS:-}"                # e.g. lab/tier=general
 
 # === GPU ===
-GPU_MODE="${GPU_MODE:-off}"                 # off: on a single-GPU host the GPU is reserved for node-2
+GPU_MODE="${GPU_MODE:-auto}"                # auto: GPU node if a GPU is detected and passthrough works
                                                    # on:   require GPU (fail if unavailable)
 GPU_CANDIDATES="${GPU_CANDIDATES:-all}"           # all | comma list of indices/UUIDs, e.g. 0 or 0,1
 

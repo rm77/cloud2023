@@ -1,9 +1,6 @@
 #!/bin/sh
 # variables.sh -- cluster-wide settings. Every value can be overridden from the environment.
 
-sudo sysctl -w fs.inotify.max_user_instances=512
-sudo sysctl -w fs.inotify.max_user_watches=524288
-
 
 ROOT_DIR="${ROOT_DIR:-$(pwd)}"
 

@@ -109,6 +109,5 @@ if [ "${GPU_NODE}" = "yes" ]; then
     wait_for "${NODE_NAME} nvidia.com/gpu capacity" "${WAIT_TIMEOUT}" node_has_gpu_capacity "${NODE_NAME}"
 fi
 
-kc label node "${NODE_NAME}" ingress-ready=true --overwrite
 kc get node "${NODE_NAME}" -o wide \
     -L nvidia.com/gpu.present
