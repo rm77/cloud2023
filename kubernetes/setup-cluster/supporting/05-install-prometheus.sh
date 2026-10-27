@@ -222,3 +222,5 @@ echo "    -n ${NAMESPACE} \\"
 echo "    -o jsonpath='{.data.admin-password}' | base64 -d"
 echo
 
+#to see grafana password, user= admin
+# kubectl -n monitoring get secret monitoring-grafana -o 'jsonpath={.data.admin-password}' | base64 -d 
