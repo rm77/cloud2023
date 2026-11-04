@@ -72,6 +72,11 @@ they may use, what it costs, and what happened.
 - **Onboarding without `vni`/`subnet`** takes the lowest free VNI from 100–254 and the subnet
   `10.<vni>.20.0/24` (your pattern: VNI 199 → 10.199.20.0/24). Both are checked against the hub's
   tenants, each other, and the underlay 10.20.0.0/16.
+- **Tenants and VMs made with `hubctl` directly are not in the API.** The API lists what it
+  created itself. `GET /provider/unmanaged` shows what exists only on the hub, and
+  `POST /provider/import` adopts it: tenants get the default quota and no users (add an admin
+  with `POST /provider/users`), and VMs get the flavor of their size or `custom`, with `hubctl`
+  as their owner.
 - **Errors:** `409` = the cluster refused (the message is hubctl's own), `502` = the hub couldn't
   be reached, `503` = the job queue is down.
 
@@ -94,6 +99,7 @@ they may use, what it costs, and what happened.
 | `GET/PATCH/DELETE /provider/tenants/{name}` | Business support | one tenant; off-board (refused while it has VMs) |
 | `PUT /provider/tenants/{name}/quota` | Business support | contract management |
 | `GET /provider/users` · `POST` · `DELETE /{u}` | Business support | every account: providers, auditors, tenant users |
+| `GET /provider/unmanaged` · `POST /provider/import` | Business support | what exists only on the hub (made with hubctl); adopt it |
 | `GET /provider/flavors` · `PUT/DELETE /{name}` | Business support | flavors and prices |
 | `GET /provider/usage` | Business support | accounting across tenants |
 | `GET /provider/images` · `POST` · `DELETE /{name}` | Portability | image catalog; import a cloud image (`202`) |
@@ -137,6 +143,21 @@ its data in `state/cloud/`.
 
 Back up `state/cloud/cloud.db` together with the rest of `state/`: it holds the users, tenants'
 quotas, VM ownership, the audit log and the usage records.
+
+## Logging in from /docs
+
+Open `http://<LABPC_IP>:36100/docs` and click **Authorize**. Enter a username and password
+and leave `client_id` and `client_secret` empty. After **Authorize** and **Close**, every call
+on the page is sent with your token.
+
+- As the provider, use `admin` and the password from `sudo ./cluster.sh cloud admin`.
+- As a tenant, use the `admin_username` / `admin_password` given when the tenant was created,
+  or an account the tenant admin added with `POST /tenant/users`. Click **Logout** first if
+  you were logged in as someone else.
+- As an auditor, use an account the provider created with `"role": "auditor"`.
+
+A login lasts 8 hours (`VDC_TOKEN_MINUTES`). A `403` that names a role means you are logged in
+as the wrong kind of user.
 
 ## A walk-through with curl
 

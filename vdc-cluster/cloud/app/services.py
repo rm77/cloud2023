@@ -53,11 +53,17 @@ def usage_of(s: Session, t: Tenant) -> Usage:
     """counted from the API's VM records, so VMs still being created already count"""
     u = Usage(vms=0, vcpus=0, mem_mb=0, disk_gb=0)
     flavors = {f.name: f for f in s.exec(select(Flavor))}
+    hub_rows = None
     for v in s.exec(select(Vm).where(Vm.tenant_id == t.id, Vm.status != "error")):
         f = flavors.get(v.flavor)
         u.vms += 1
         if f:
             u.vcpus += f.vcpus; u.mem_mb += f.mem_mb; u.disk_gb += f.disk_gb
+        else:                                   # imported VM: its size as the hub has it
+            if hub_rows is None:
+                hub_rows = {r["name"]: r for r in hub_call(labhub.hub_read, "vms")}
+            h = hub_rows.get(v.name, {})
+            u.vcpus += int(h.get("cpus") or 1); u.mem_mb += int(h.get("mem") or 0)
     return u
 
 

@@ -44,6 +44,9 @@ def onboard(body: TenantIn, c: Caller = Depends(provider), s: Session = Depends(
         raise HTTPException(409, f"tenant {body.name} exists")
     if s.exec(select(User).where(User.username == body.admin_username)).first():
         raise HTTPException(409, f"user {body.admin_username} exists")
+    if any(r["name"] == body.name for r in hub_call(labhub.hub_read, "tenants")):
+        raise HTTPException(409, f"tenant {body.name} already exists on the hub (made with hubctl): "
+                                 f"POST /provider/import adopts it")
     vni, subnet = pick_network(s, body.vni, body.subnet)
     hub_call(labhub.hub, "tenant", "add", body.name, vni, subnet)        # the network exists from here on
     q = body.quota or Quota(**config.DEFAULT_QUOTA)
@@ -55,6 +58,54 @@ def onboard(body: TenantIn, c: Caller = Depends(provider), s: Session = Depends(
     audit(s, c, "tenant.create", body.name, detail=f"VNI {vni}, subnet {subnet}, admin {body.admin_username}",
           tenant=body.name)
     return tenant_out(s, t)
+
+
+def unmanaged_on_hub(s: Session):
+    """tenants and VMs the hub has but the API does not know (made with hubctl directly)"""
+    known_t = {t.name for t in s.exec(select(Tenant))}
+    known_v = {v.name for v in s.exec(select(Vm))}
+    tenants = [r for r in hub_call(labhub.hub_read, "tenants") if r["name"] not in known_t]
+    vms = [r for r in hub_call(labhub.hub_read, "vms") if r["name"] not in known_v]
+    return tenants, vms
+
+
+@router.get("/unmanaged", tags=[CUST],
+            summary="Tenants and VMs on the hub that the API does not know (created with hubctl)")
+def unmanaged(s: Session = Depends(get_session)):
+    tenants, vms = unmanaged_on_hub(s)
+    return dict(tenants=[dict(name=r["name"], vni=int(r["vni"]), subnet=r["subnet"]) for r in tenants],
+                vms=[dict(name=r["name"], tenant=r["tenant"], node=r["node"], ip=r["ip"],
+                          mem_mb=int(r["mem"] or 0), cpus=int(r["cpus"] or 1)) for r in vms],
+                hint="POST /provider/import adopts them" if tenants or vms else "nothing to import")
+
+
+@router.post("/import", tags=[CUST],
+             summary="Adopt tenants and VMs made with hubctl: default quota, no users (add them with POST /provider/users)")
+def import_from_hub(c: Caller = Depends(provider), s: Session = Depends(get_session)):
+    tenants, vms = unmanaged_on_hub(s)
+    q = config.DEFAULT_QUOTA
+    added_t, added_v, skipped = [], [], []
+    for r in tenants:
+        s.add(Tenant(name=r["name"], display_name="imported from hubctl", vni=int(r["vni"]),
+                     subnet=r["subnet"], **q))
+        added_t.append(r["name"])
+    s.commit()
+    tid = {t.name: t.id for t in s.exec(select(Tenant))}
+    # a VM gets the flavor of exactly its size, else "custom" (counted as a VM, priced at 0)
+    by_size = {(f.vcpus, f.mem_mb): f.name for f in s.exec(select(Flavor))}
+    for r in vms:
+        if r["tenant"] not in tid:
+            skipped.append(f"{r['name']}: tenant {r['tenant']} unknown"); continue
+        size = (int(r["cpus"] or 1), int(r["mem"] or 0))
+        s.add(Vm(name=r["name"], tenant_id=tid[r["tenant"]], owner="hubctl", flavor=by_size.get(size, "custom"),
+                 image=r["image"] or "cirros", status="active"))
+        added_v.append(r["name"])
+    s.commit()
+    audit(s, c, "hub.import", ",".join(added_t + added_v)[:200],
+          detail=f"{len(added_t)} tenant(s), {len(added_v)} VM(s)")
+    return dict(tenants=added_t, vms=added_v, skipped=skipped,
+                next="give each imported tenant an admin: POST /provider/users "
+                     '{"role":"consumer","tenant":"<name>","tenant_admin":true,...}' if added_t else "")
 
 
 @router.get("/tenants/{name}", response_model=TenantOut, tags=[CUST], summary="One tenant")

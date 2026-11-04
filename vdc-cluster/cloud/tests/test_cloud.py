@@ -172,6 +172,31 @@ def test_delete_vm_releases_quota(client):
     assert client.get("/tenant/me", headers=H["bob"]).json()["usage"]["vms"] == 1
 
 
+def test_tenant_made_with_hubctl_is_invisible_until_imported(client, hub):
+    # what happens when someone runs: hubctl tenant add tenant-x 150 10.150.20.0/24; hubctl vm add tenant-x x1
+    hub.tenants["tenant-x"] = (150, "10.150.20.0/24")
+    hub.vms["x1"] = dict(tenant="tenant-x", node="hv101", image="cirros", ip="10.150.20.10",
+                         mem="512", cpus="1", mac="52:54:01:00:00:99", state="running")
+    names = [t["name"] for t in client.get("/provider/tenants", headers=H["admin"]).json()]
+    assert "tenant-x" not in names                                              # the API never heard of it
+    un = client.get("/provider/unmanaged", headers=H["admin"]).json()
+    assert [t["name"] for t in un["tenants"]] == ["tenant-x"] and [v["name"] for v in un["vms"]] == ["x1"]
+    r = client.post("/provider/tenants", headers=H["admin"], json=dict(
+        name="tenant-x", admin_username="xena", admin_password="xena-pass-1"))
+    assert r.status_code == 409 and "/provider/import" in r.json()["detail"]
+    r = client.post("/provider/import", headers=H["admin"]).json()
+    assert r["tenants"] == ["tenant-x"] and r["vms"] == ["x1"]
+    t = client.get("/provider/tenants/tenant-x", headers=H["admin"]).json()
+    assert (t["vni"], t["subnet"], t["usage"]["vms"], t["usage"]["mem_mb"]) == (150, "10.150.20.0/24", 1, 512)
+    assert client.get("/provider/unmanaged", headers=H["admin"]).json()["vms"] == []
+    # give it an admin, who then sees the imported VM
+    assert client.post("/provider/users", headers=H["admin"], json=dict(
+        username="xena", password="xena-pass-1", role="consumer", tenant="tenant-x", tenant_admin=True)).status_code == 201
+    hx = login(client, "xena", "xena-pass-1")
+    vms = client.get("/tenant/vms", headers=hx).json()
+    assert [(v["name"], v["flavor"], v["ip"], v["owner"]) for v in vms] == [("x1", "small", "10.150.20.10", "hubctl")]
+
+
 def test_openapi_is_organised_by_ccra(client):
     spec = client.get("/openapi.json").json()
     tags = {t["name"] for t in spec["tags"]}
