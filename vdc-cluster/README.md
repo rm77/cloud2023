@@ -1,530 +1,465 @@
-# vdc-cluster — expandable hub-and-spoke libvirt cluster (nested, Alpine)
+# vdc-cluster
 
-Successor of checkpoint **HUB-SPOKE-INFRA**. Same overlay (Geneve hub-and-spoke over a
-Linux-bridge underlay), but the two roles are separate, self-contained images, and
-**adding a hypervisor = clone the spoke image and boot it**. The spoke joins the hub by
-itself; nothing is edited by hand, no host list exists anywhere. Spokes can run on the
-same PC as the hub or on other PCs on the same switch (multi-PC mode).
+A small virtual data centre you can run on one lab PC, or spread over several. It has one hub
+VM and any number of spoke VMs (hypervisors). Tenants get isolated networks that span all
+spokes, and VMs on those networks.
+
+To add a hypervisor you clone the spoke image and boot it. It finds the hub and joins by
+itself, and nothing has to be edited by hand.
 
 ```
- PC 1 (main)                                         PC 2 (worker)               PC n ...
- br-under 10.20.1.1 ── [UPLINK_NIC] ── switch ── [UPLINK_NIC] ── br-under 10.20.2.1
-   ├─ tap-hub   ── hub   10.20.0.2    control plane + compute:     ├─ tap-hv201 ── hv201 10.20.2.101
-   │                                  DNS, NAT (eth0=internet),    └─ tap-hv202 ── hv202 10.20.2.102
-   │                                  join API :8080, tunnels,
-   │                                  libvirtd, hubctl
-   ├─ tap-hv101 ── hv101 10.20.1.101  spoke: libvirtd + lab-agent ── CirrOS guests
-   └─ tap-hv102 ── hv102 10.20.1.102  (linked clones of images/spoke.qcow2)
+ PC 1 (main)                                         PC 2 (optional)
+ br-under 10.20.1.1 ── [uplink NIC] ── switch ── [uplink NIC] ── br-under 10.20.2.1
+   ├─ hub    10.20.0.2    DNS, NAT to the internet,         ├─ hv201 10.20.2.101
+   │                      join API :8080, hubctl            └─ hv202 10.20.2.102
+   ├─ hv101  10.20.1.101  spoke: libvirt + lab-agent
+   └─ hv102  10.20.1.102
 ```
 
-On a single PC there is no uplink NIC and no host.conf: everything below "Multi-PC" is optional.
+Everything is driven by two tools. `cluster.sh` runs on the lab PC and manages the VMs and the
+underlay network. `hubctl` runs on the hub and manages tenants, addresses and guest VMs. On top
+of both there is an optional REST API with logins for providers, tenants and auditors (see
+[The cloud API](#the-cloud-api)).
 
-## Addressing
 
-Static by default: no DHCP server on the underlay. The address of every machine follows
-from its name, on one /16:
+## What you need
 
-| | address | set by |
-|---|---|---|
-| hub | 10.20.0.2 | hub image |
-| PC *ID* (main PC = 1) | 10.20.*ID*.1 | `cluster.sh net-up` (`LABPC_IP` in host.conf) |
-| spoke hv*ID**NN* | 10.20.*ID*.*(100+NN)* — hv203 = 10.20.2.103 | `cluster.sh` → SMBIOS `lab.ip` → `lab-net` on the spoke |
-| bare-metal spoke | 10.20.0.3 – 10.20.0.99 | `IP=` (and optional `GW=`) in `/etc/lab/join.conf` |
-| DHCP pool (only with `IP_MODE=dhcp`) | 10.20.0.100 – 10.20.0.250 | dnsmasq on the hub |
+- Linux with `qemu-system-x86_64`, `qemu-img`, `packer`, `socat`, `iproute2` and `tcpdump`
+- nested KVM: `cat /sys/module/kvm_intel/parameters/nested` should print `Y` (on AMD, the
+  `kvm_amd` module)
+- about 2 GB of RAM per VM, more if tenants run Ubuntu guests
+- root: every `cluster.sh` command runs with `sudo`
 
-- At boot, the spoke service `lab-net` (before `networking`) writes `/etc/network/interfaces`:
-  address, gateway = hub (NAT to the internet), MTU, and `resolv.conf` → hub DNS (`<name>.lab`).
-- The hub refuses a join from an address another member already uses
-  (`ERROR ip-in-use by hv203`); `hubctl node del hv203` if that machine is really gone.
-- **DHCP is opt-in:** `IP_MODE=dhcp` in `cluster.conf` (then rebuild both images) makes the hub
-  a DHCP server again and spokes take leases; a single machine can also use `IP=dhcp` in its
-  `join.conf`. Static mode needs `UNDERLAY_PREFIX=16`.
-- Before using 10.20.0.0/16, run `ip route` on the lab PCs: if 10.20.x is used on campus,
-  change `UNDERLAY_NET`, `HUB_IP`, `LABPC_IP` and the pool to another /16 (e.g. 10.77.x).
+The lab uses 10.20.0.0/16 for its own network. Run `ip route` first: if 10.20.x is already used
+where you are, pick another /16 in `cluster.conf` (`UNDERLAY_NET`, `HUB_IP`, `LABPC_IP`).
 
-## Layout
 
-| Path | Where it runs | What |
-|---|---|---|
-| `cluster.conf` | every PC + baked into both images as `/etc/lab/cluster.env` | addressing, sizes, versions, timeouts |
-| `host.conf` | this PC only (written by `host init`) | `HOST_ID`, `HOST_ROLE`, `LABPC_IP`, `UPLINK_NIC` |
-| `cluster.sh` | every PC | init, build, up, `spoke add N`, start/stop, rm, list, console, ssh, logs, host, mtu-check |
-| `cloud/` | main PC (`cluster.sh cloud ...`) | the cloud API: FastAPI, organised by NIST CCRA (see Cloud API) |
-| `common/` | both images | `setup-base.sh`; `lib.sh` (bridge/tunnel/libvirt helpers), `lab-guest` |
-| `hub/` | hub image | `setup.sh`, `hubctl`, services `lab-hub` + `lab-api`, CGI `join/state/leave` |
-| `spoke/` | spoke image | `setup.sh`, `lab-net` (underlay address at boot), `lab-agent` + services |
-| `image/` | main PC | `alpine-install.sh`, `alpine.pkr.hcl`, `build.sh` → `images/hub.qcow2`, `images/spoke.qcow2` |
-| `logs/` | every PC | **all logs** (see Logs) |
-| `state/` | every PC | lab SSH key, join token, VM disks (`state/vms/`); main PC also `state/cloud/` (API database, secrets, venv) |
-
-The `*/setup.sh` scripts also work on an already-installed Alpine machine
-(`KIT=/root/vdc-cluster sh spoke/setup.sh`, then reboot) — e.g. a bare-metal spoke.
-
-## Quick start (one PC)
-
-Needs: `qemu-system-x86_64`, `qemu-img`, `packer`, `socat`, `iproute2`, `tcpdump`, and
-nested KVM (`cat /sys/module/kvm_intel/parameters/nested` → `Y`). Everything runs as root.
+## First run
 
 ```bash
-sudo ./cluster.sh init            # state/id_lab (SSH key) + state/token; (re)creates br-under, tap-hub
-sudo ./cluster.sh build           # ~10 min: images/hub.qcow2 + images/spoke.qcow2, with progress
-sudo ./cluster.sh up              # br-under + hub, follows its boot until hubctl answers
-sudo ./cluster.sh spoke add 3     # hv101..hv103: clone, boot in parallel, follow each join
+sudo ./cluster.sh init            # SSH key and join token in state/, network bridge br-under
+sudo ./cluster.sh build           # builds images/hub.qcow2 and images/spoke.qcow2 (about 10 minutes)
+sudo ./cluster.sh up              # starts the hub and waits until it answers
+sudo ./cluster.sh spoke add 3     # hv101, hv102, hv103: clone, boot, join
+sudo ./cluster.sh list
+```
 
-sudo ./cluster.sh hubctl tenant add acme 100      # subnet 192.168.100.0/24
-sudo ./cluster.sh hubctl vm add acme r1           # CirrOS; node + address chosen by the hub
-sudo ./cluster.sh hubctl vm add acme r2 hv103     # or pin the node
-sudo ./cluster.sh hubctl vms                      # r1 192.168.100.10, r2 192.168.100.11
-sudo ./cluster.sh hubctl vm console r1            # cirros / vdclab; ping 192.168.100.11
+`list` shows the VMs on this PC and, below them, the hub's view of the cluster. Every spoke
+should be `Ready`:
 
-# other tenant images, e.g. an Ubuntu cloud image you downloaded
+```
+NAME     IP             MAC               STATUS    GUESTS RAM FREE/TOTAL
+hub      10.20.0.2      52:54:00:20:00:02 Ready     0      1465/1977 MB
+hv101    10.20.1.101    52:54:00:21:01:01 Ready     0      1480/1977 MB
+```
+
+While the spokes boot, `spoke add` shows each one's progress (booting, address, join, tunnels,
+Ready). It usually takes 10 to 20 seconds per spoke. Ctrl-C only stops the display, the VMs keep
+going.
+
+Logins: the hub and spokes accept `root` / `vdclab` on the console (`sudo ./cluster.sh console
+hv101`, leave with Ctrl-]). `sudo ./cluster.sh ssh hv101` logs in with the lab key.
+
+Keep `state/` safe. It holds the SSH key the images were built with. If you lose it, `init`
+makes a new key and you have to rebuild the images.
+
+
+## Tenants and VMs
+
+A tenant is a network: a VNI (the tunnel ID) and a subnet. The hub gives every guest an address
+from its tenant's subnet, so you never type one.
+
+```bash
+sudo ./cluster.sh hubctl tenant add tenant-a 199 10.199.20.0/24
+sudo ./cluster.sh hubctl tenant add tenant-b 198 10.198.20.0/24
+
+sudo ./cluster.sh hubctl vm add tenant-a a1       # CirrOS, gets 10.199.20.10
+sudo ./cluster.sh hubctl vm add tenant-a a2       # 10.199.20.11, probably on another spoke
+sudo ./cluster.sh hubctl vm add tenant-b b1       # 10.198.20.10
+sudo ./cluster.sh hubctl vms                      # where each guest runs and its state
+sudo ./cluster.sh hubctl vm console a1            # log in as cirros / vdclab, then ping 10.199.20.11
+```
+
+a1 can reach a2 even when they run on different spokes. Neither can reach b1: the two tenants
+have separate bridges with no router between them, even on the same spoke.
+
+Addresses start at .10 of the subnet (.1 to .9 are kept free). Use `--ip` to pick one yourself,
+and `hubctl ips tenant-a` to see what is taken and what comes next. The hub places each guest on
+the Ready spoke with the most free RAM, unless you name a spoke: `hubctl vm add tenant-a a3 hv102`.
+
+To remove things:
+
+```bash
+sudo ./cluster.sh hubctl vm del a2                # its address becomes free again
+sudo ./cluster.sh hubctl tenant del tenant-b      # only once it has no guests
+```
+
+### Other guest images
+
+CirrOS is built in. Any cloud image with cloud-init works too:
+
+```bash
 sudo ./cluster.sh image add ubuntu ~/Downloads/noble-server-cloudimg-amd64.img
-sudo ./cluster.sh hubctl vm add acme web1 --image ubuntu
+sudo ./cluster.sh image add debian https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2 --user debian
+sudo ./cluster.sh images
+sudo ./cluster.sh hubctl vm add tenant-a web1 --image ubuntu
 ```
 
-Grow later: `sudo ./cluster.sh spoke add 2` → hv104, hv105; every tenant gets two more hub
-tunnels automatically. Shrink: `hubctl vm del ...` for its guests, then `sudo ./cluster.sh rm hv105`.
+A file is uploaded from this PC, and a URL is downloaded by the hub. The guest's hostname,
+password and address are handed over on a small cloud-init CD (NoCloud). For an image without
+cloud-init use `--type none`: the address is still reserved, but you set it inside the guest.
 
-Spoke names are `hv<HOST_ID><NN>`: hv101 is spoke 1 on PC 1 (10.20.1.101), hv201 spoke 1 on PC 2 (10.20.2.101).
+The login is the image's default user (`ubuntu`, `debian`, ...) with the password `vdclab`
+(`GUEST_PASSWORD` in `cluster.conf`). `hubctl vm info web1` shows it.
 
-Self-service through the cloud API instead of `hubctl` (see Cloud API):
+An Ubuntu guest needs 1 GB of RAM, and a spoke has 2 GB by default with 512 MB kept for itself.
+If `vm add` says no node has enough RAM free, add spokes or raise `SPOKE_MEM` in `cluster.conf`.
+
+### Growing and shrinking
 
 ```bash
-sudo ./cluster.sh cloud install && sudo ./cluster.sh cloud start   # http://10.20.1.1:36100/docs
+sudo ./cluster.sh spoke add 2         # hv104, hv105; existing tenants reach them at once
+sudo ./cluster.sh stop hv105          # power off (start brings it back and waits for the join)
+sudo ./cluster.sh rm hv105            # remove it from the hub and delete its disk
 ```
 
-## Cloud API
+`rm` refuses while the spoke still has guests. Delete them first (`hubctl vms` shows where each one runs).
 
-`cloud/` is a REST API on top of the cluster, organised by the NIST Cloud Computing Reference
-Architecture (SP 500-292). Each CCRA actor has its own part of the API and its own role:
 
-| Prefix | CCRA actor | Role | Can do |
-|---|---|---|---|
-| `/tenant` | Cloud Consumer | `consumer` | its own tenant only: VMs, network, jobs, usage, members |
-| `/provider` | Cloud Provider | `provider` | onboard tenants (VNI + subnet from a pool), quotas, flavors, images, spokes, every tenant's VMs |
-| `/audit` | Cloud Auditor | `auditor` | read only: audit log, reports, metering, the command journal of any node |
-| `/carrier` | Cloud Carrier | `provider`, `auditor` | underlay health |
+## The cloud API
 
-It drives the cluster only through `hubctl` (over SSH with `state/id_lab`) and `cluster.sh`, so
-the hub still allocates addresses, places VMs and builds the tunnels. The API adds what the hub
-doesn't know: users and roles, tenant ownership, quotas, flavors and prices, jobs, an audit log,
-and usage metering.
+The API lets students manage their own tenant through a web page or `curl`, without root on
+the lab PC. It follows the NIST Cloud Computing Reference Architecture (CCRA). Each kind of
+user (the CCRA calls them actors) has its own part of the API:
+
+| Path | Who | Can do |
+|---|---|---|
+| `/provider` | lab staff (role `provider`) | create tenants, set quotas, flavors and images, add spokes, see everything |
+| `/tenant` | a student group (role `consumer`) | its own VMs, network, jobs and usage, and its own members |
+| `/audit` | TA or auditor (role `auditor`) | read only: who did what, usage, and the commands the cluster ran |
+| `/carrier` | provider, auditor | health of the underlay network |
+
+Under the hood every request becomes a `hubctl` or `cluster.sh` call, so the hub still picks
+addresses and spokes. The API adds the logins, quotas, prices, an audit log and usage metering.
+
+### Starting it
+
+On the main PC, after `cluster.sh up`:
 
 ```bash
-sudo ./cluster.sh cloud install            # Python venv + Redis + secrets in state/cloud/
-sudo ./cluster.sh cloud start              # api, job worker, usage meter; logs in logs/cloud/
-sudo ./cluster.sh cloud admin              # provider login: admin / <generated>
-# open http://<LABPC_IP>:36100/docs -> Authorize -> try POST /provider/tenants
-sudo ./cluster.sh cloud enable             # optional: systemd, survives reboots
+sudo ./cluster.sh cloud install       # Python environment, Redis, secrets (once)
+sudo ./cluster.sh cloud start         # prints the address, e.g. http://10.20.1.1:36100/docs
+sudo ./cluster.sh cloud admin         # the provider login: admin and a generated password
 ```
 
-Settings are the `CLOUD_*` lines in `cluster.conf`. Endpoints, rules, the CCRA mapping and a
-curl walk-through are in `cloud/README.md`. The API runs on the main PC only.
+`cloud status` shows whether it runs, `cloud logs worker` follows a log, `cloud stop` stops it,
+and `cloud enable` installs systemd services so it comes back after a reboot. After a reboot,
+start the hub again with `cluster.sh up`.
 
-## Progress
+Open the address in a browser. The page (Swagger UI) lists every call, grouped by CCRA function,
+and lets you try each one.
 
-`build`, `up`, `spoke add` and `start` show what is happening instead of waiting silently.
+### Logging in as the provider and creating a tenant
 
-**Creating and joining spokes** — every VM prints `LAB: ...` lines on its serial console
-(lab-agent, hubctl, lab-api); `cluster.sh` follows the console logs of all new VMs at once
-and confirms the last step with the hub:
+1. Click **Authorize** at the top right.
+2. Enter the username `admin` and the password from `cloud admin`. Leave `client_id` and
+   `client_secret` empty.
+3. Click **Authorize**, then **Close**.
+4. Open `POST /provider/tenants`, click **Try it out**, and send:
 
-```
-== creating 2 spoke(s) on host 1
-  hv101  disk   linked clone of images/spoke.qcow2
-  hv101  start  QEMU pid 4711, tap-hv101, 52:54:00:21:01:01, 10.20.1.101
-  hv102  disk   linked clone of images/spoke.qcow2
-  hv102  start  QEMU pid 4725, tap-hv102, 52:54:00:21:01:02, 10.20.1.102
-== boot + join
-   0:02  hv101   [#......] 1/7  booting (OpenRC)
-   0:02  hv101   [##.....] 2/7  underlay 10.20.1.101/16 on eth0 (static, gateway 10.20.0.2)
-   0:03  hv101   [###....] 3/7  agent started
-   0:03  hv101   [####...] 4/7  join request -> hub 10.20.0.2
-   0:03  hv102    !  join failed: hub 10.20.0.2:8080 unreachable, retrying every 2s
-   0:04  hv101   [#####..] 5/7  joined as hv101 (10.20.1.101)
-   0:05  hv101   [######.] 6/7  tunnels + libvirt networks up: hv101 (10.20.1.101), 2 tenant(s)
-   0:06  hv101   [#######] 7/7  Ready in hubctl nodes
-   ...
-  VM       NODE     RESULT   TIME
-  hv101    hv101    ok       0:06
-  hv102    hv102    ok       0:07
+```json
+{
+  "name": "tenant-a",
+  "vni": 199,
+  "subnet": "10.199.20.0/24",
+  "admin_username": "alice",
+  "admin_password": "alice-pass-1"
+}
 ```
 
-Problems the VM reports (no address configured, hub unreachable, bad token, address in use)
-appear as `!` lines.
-After `JOIN_TIMEOUT` (300 s) a stuck VM is reported with its last console lines.
-Ctrl-C only stops watching; the VMs keep booting.
+This creates the tenant network on the hub and an account for its admin, alice. If you leave
+out `vni` and `subnet`, the API takes the next free VNI from 100 upward and the subnet
+`10.<vni>.20.0/24`.
 
-**Hub** (`up`): booting → hub state ready (members, tenants) → join API listening → hubctl answers.
+### Logging in as a tenant
 
-**Images** (`build`): Packer's stages (`packer: Starting VM ...`) interleaved with the
-installer's numbered steps (`[ 5] bake role: hub`). If the installer fails, the build
-stops at once and shows the failing lines instead of waiting for Packer's timeout.
+1. Click **Authorize**, then **Logout** to drop the provider login.
+2. Click **Authorize** again and enter `alice` / `alice-pass-1` (`client_id` and
+   `client_secret` stay empty).
+3. Try `GET /tenant/me`. It shows tenant-a's network, quota and usage.
+4. Create a VM with `POST /tenant/vms` and `{"name": "a1", "flavor": "small"}`. The answer
+   contains a job; `GET /tenant/jobs/{id}` shows when it is finished, and `GET /tenant/vms/a1`
+   shows the address the hub gave it.
 
-**Join speed:** the address is static (no DHCP round trip), the agent retries every 2 s until
-joined (not every `POLL`), and a fresh clone generates only an Ed25519 host key.
-With nested KVM a clone goes from power-on to Ready in roughly 10–15 s.
+The tenant is part of the login, so tenant calls never ask which tenant you mean. A tenant
+can't reach anything else: `/provider/...` answers 403, and another tenant's VM answers 404.
+
+Alice is the tenant admin. She can add her group members with `POST /tenant/users`, and they
+log in the same way. The provider can also create tenant users with `POST /provider/users`
+(`"role": "consumer", "tenant": "tenant-a"`), and auditors with `"role": "auditor"`.
+
+A login lasts 8 hours. When calls start answering 401, log in again. To show the provider,
+tenant and auditor views side by side in class, use a private browser window for each.
+
+### The same from the command line
+
+The login is a plain form post, not JSON:
+
+```bash
+API=http://10.20.1.1:36100
+TOKEN=$(curl -s -d 'username=alice&password=alice-pass-1' $API/auth/token |
+        python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+
+curl -s -H "Authorization: Bearer $TOKEN" $API/tenant/me
+curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -X POST $API/tenant/vms -d '{"name":"a1","flavor":"small"}'
+```
+
+### When a call fails
+
+| Answer | Meaning |
+|---|---|
+| 401 wrong username or password | no such account, or the wrong password |
+| 401 invalid or expired token | log in again |
+| 403 this endpoint is for the consumer role | you are logged in as the provider: Logout and log in as the tenant |
+| 403 quota exceeded | the tenant reached its limit; the provider can raise it (`PUT /provider/tenants/{name}/quota`) |
+| 404 no VM ... in tenant ... | the VM doesn't exist in your tenant |
+| 409 cluster: ... | the hub refused, and the message says why (name taken, subnet full, ...) |
+| 502 cluster: hub not reachable | the hub VM is down: `sudo ./cluster.sh list` |
+| 503 job queue | Redis is down: `sudo ./cluster.sh cloud status` |
+
+The full list of calls, the rules behind them and how they map to the CCRA are in
+`cloud/README.md`. The API's settings are the `CLOUD_*` lines in `cluster.conf`.
+
+
+## More than one PC
+
+All PCs share one underlay network. Each PC bridges a spare NIC, or a VLAN on one, into its
+`br-under`, and those NICs go to the same switch. The hub runs on the main PC; every PC can run
+spokes.
+
+Use a separate switch or VLAN for this, never the normal campus LAN: the underlay carries lab
+traffic and the join token unencrypted. The uplink NIC must not have an IP address, and the
+switch must pass 1600-byte frames.
+
+On the main PC:
+
+```bash
+sudo ./cluster.sh host init 1 enp2s0      # this PC is host 1, its uplink NIC is enp2s0
+sudo ./cluster.sh init && sudo ./cluster.sh build && sudo ./cluster.sh up
+sudo ./cluster.sh host export             # vdc-host-bundle.tar for the other PCs
+```
+
+The bundle contains the join token and the lab's SSH key, so copy it only to your own PCs.
+On each other PC:
+
+```bash
+mkdir vdc-cluster && tar xf vdc-host-bundle.tar -C vdc-cluster && cd vdc-cluster
+sudo ./cluster.sh host init 2 enp2s0      # host 2 (3, 4, ... for the next PCs)
+sudo ./cluster.sh net-up
+sudo ./cluster.sh mtu-check               # do 1600-byte frames reach the hub?
+sudo ./cluster.sh spoke add 4             # hv201 .. hv204, joined to the hub on PC 1
+```
+
+If `mtu-check` fails and you can't change the switch, set `UNDERLAY_MTU=1500` and
+`TENANT_MTU=1450` in `cluster.conf` on every PC and rebuild the images.
+
+Tenants and guests are cluster-wide: `hubctl vm add tenant-a a7` may place a7 on a spoke in
+the next room.
+
+
+## Addresses
+
+Nothing on the underlay uses DHCP. Every address follows from the machine's name:
+
+| Machine | Address |
+|---|---|
+| hub | 10.20.0.2 |
+| lab PC with host ID *n* | 10.20.*n*.1 (the main PC is 10.20.1.1) |
+| spoke hv*n**NN* | 10.20.*n*.(100 + *NN*): hv101 is 10.20.1.101, hv203 is 10.20.2.103 |
+| bare-metal spoke | 10.20.0.3 to 10.20.0.99, set with `IP=` in its `/etc/lab/join.conf` |
+
+The spokes use the hub as gateway (NAT to the internet) and as DNS server (`hv101.lab`). If you
+really want DHCP, set `IP_MODE=dhcp` in `cluster.conf` and rebuild the images. The hub then
+hands out 10.20.0.100 to 10.20.0.250.
+
 
 ## Logs
 
-Every log of the lab ends up in `logs/` on the PC that ran the command:
+Everything ends up in `logs/` on the PC where you ran the command:
 
-```
-logs/
-  cluster.log                 every cluster.sh run: command, timestamped output (incl. progress)
-  commands/<tool>.log         command journal of this PC: qemu, qemu-img, ip, packer, socat, ping...
-  build/<role>.packer.log     full Packer output
-  build/<role>.console.log    the installer's serial console (### steps, apk output, errors)
-  build/<role>-commands/      command journal of the image build: apk, setup-disk, sfdisk, mkfs,
-                              mount, chroot, rc-update ... + files.log (config files written)
-  vm/<name>.console.log       each VM's serial console, all boots appended (LAB: progress lines,
-                              OpenRC, kernel) - also what ./cluster.sh console shows
-  vm/<name>.qemu.log          QEMU start errors
-  nodes/<name>/               copied from inside a VM by "logs collect":
-     lab/net.log                spoke: underlay address chosen at boot     (/var/log/lab/)
-     lab/agent.log              spoke: join, sync, tenant changes
-     lab/hub.log                hub: joins, leaves, tenants, evictions
-     lab/api.log                hub: every API request (busybox httpd)
-     lab/dnsmasq.log            hub: DNS (and DHCP leases with IP_MODE=dhcp)
-     lab/guest.log              any node: guests created/removed
-     lab/commands/<tool>.log    command journal of that VM: ip, virsh, qemu-img, wget, ...
-     messages, libvirt/         syslog and libvirtd logs
-```
-
-```bash
-sudo ./cluster.sh logs                    # list all files
-sudo ./cluster.sh logs tail hv101         # follow a VM's console log (works while it boots)
-sudo ./cluster.sh logs collect            # pull /var/log/lab etc. from the hub and every member
-sudo ./cluster.sh logs collect hv201      # one node - also one on another PC
-```
-
-`rm` deletes a VM's disk but keeps its logs.
-
-## Tenant images and addresses
-
-**Images.** The hub keeps a catalog of tenant base images and serves them to the nodes;
-each node downloads an image once, checks its SHA-256 and caches it under that checksum
-(`/var/lib/libvirt/images/base/<image>-<sha>.qcow2`), so replacing an image never breaks
-existing guests. Every guest is a copy-on-write overlay on its base.
-
-```bash
-sudo ./cluster.sh image add ubuntu ~/Downloads/noble-server-cloudimg-amd64.img   # upload from this PC
-sudo ./cluster.sh image add debian https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2 --user debian
-sudo ./cluster.sh images
-IMAGE          TYPE       RAM      DISK   LOGIN    FILE      SHA256
-cirros         cirros     192MB    1G     cirros   21MB      ...
-ubuntu         cloud-init 1024MB   10G    ubuntu   583MB     ...
-```
-
-| `--type` | what the guest gets | for |
-|---|---|---|
-| `cloud-init` (default) | seed ISO with `#cloud-config` user-data (hostname, password) + `network-config` v2 (static address, matched by MAC) | Ubuntu, Debian, Fedora, Rocky, Alpine *cloud* images — anything with cloud-init |
-| `cirros` | seed ISO with a user-data script that sets the address | CirrOS (baked into the hub, always in the catalog) |
-| `none` | no seed: the address is reserved in the IPAM but not applied | images without cloud-init |
-
-`--mem` / `--disk` set the default RAM and (virtual, sparse) disk size of guests from that
-image, `--user` the login the image's cloud-init creates (`ubuntu`, `debian`, `fedora`, ...).
-Raw images are converted to qcow2 on the hub. `hubctl image del NAME` refuses while guests use it.
-
-**Addresses (IPAM).** Every tenant has a subnet; the hub hands out every guest's address —
-nobody types one, and there is no DHCP on tenant networks:
-
-```bash
-hubctl tenant add acme 100                      # 192.168.100.0/24 (default for VNI 1-254)
-hubctl tenant add beta 2000 10.88.0.0/24        # any subnet (/16-/29); tenants may overlap
-hubctl vm add acme web1 --image ubuntu          # -> 192.168.100.10
-hubctl vm add acme web2 --image ubuntu          # -> 192.168.100.11
-hubctl vm add acme db1 --ip 192.168.100.50      # a chosen one: checked against the subnet and in-use
-hubctl ips acme                                 # allocations + next free
-```
-
-- Allocation: lowest free address from **.10**; `.1` stays free for a future tenant gateway,
-  `.2-.9` for future services (subnets of 32 addresses or fewer only keep `.1`).
-- The address is stored with the guest in the hub's registry (with a generated MAC
-  `52:54:01:xx:xx:xx`), written into the guest's seed, and released when the guest is deleted.
-- Tenant networks are isolated L2 segments with no router: guests reach each other, not the
-  internet or the underlay.
-
-**Seed.** `lab-guest` on the chosen node builds `<guest>-seed.iso` (label `cidata`, the NoCloud
-datasource) with `xorriso` and attaches it as a CD-ROM. All three seed files are in the
-command journal (`files.log`, password masked), next to the `qemu-img` and `virsh define` calls.
-
-**Login.** Console (`hubctl vm console NAME`) and SSH between guests of a tenant: the image's
-user (`hubctl vm info NAME`) with `GUEST_PASSWORD` (cluster.conf, default `vdclab`).
-
-**Sizing.** The scheduler places a guest on the Ready node with the most free RAM that fits it
-(node RAM as reported by its agent, minus `GUEST_HOST_RESERVE` = 512 MB, minus its guests;
-`hubctl nodes` shows free/total). A 2 GB spoke fits one 1 GB Ubuntu guest; for several,
-raise `SPOKE_MEM` (e.g. 4096). Ubuntu guests are the second level of nesting — without nested
-KVM on the lab PC they boot in minutes instead of seconds. `DISK_SIZE` is 20G (sparse) to
-hold base images and guest overlays.
-
-## Command journal
-
-Every provisioning tool the lab runs is journaled — in its own file per tool, plus one
-`all.log` in order — so students can see exactly which commands build a virtual data
-centre, who ran them, why, and with what result:
-
-```
-2026-10-28 08:29:55 hv101 [lab-agent] $ ip link add gnv100 type geneve id 100 remote 10.20.0.2  # Geneve tunnel gnv100: VNI 100 to 10.20.0.2, port of br-t100
-2026-10-28 08:29:55 hv101 [lab-agent] = rc=0 0.01s ip
-2026-10-28 08:29:55 hv101 [lab-agent] $ ip link set gnv100 master br-t100  # Geneve tunnel gnv100: ...
-2026-10-28 09:00:02 build-hub [installer] $ setup-disk -m sys -s 0 /dev/vda  # install Alpine to /dev/vda
-2026-10-28 09:00:02 build-hub [installer]   $ sfdisk --quiet --label dos /dev/vda      <- run by setup-disk
-2026-10-28 09:00:02 build-hub [installer]   $ mkfs.ext4 -q /dev/vda1
-```
-
-`$` = the command exactly as run (shell-quoted, secrets like the join token shown as `***`),
-`# ...` = why, `[...]` = which script, `=` = exit code and duration, indentation = called by
-the command above it. Config files handed to `virsh` / `nft`, and the ones the scripts write
-(`interfaces`, `dnsmasq.conf`, `nftables.nft`, libvirt XML, ...) are logged with their content.
-
-| Where | Journal | Typical tools |
-|---|---|---|
-| lab PC | `logs/commands/` | `qemu-system-x86_64` (full command line of every VM), `qemu-img`, `ip` (bridge, taps, VLAN), `socat`, `ping`, `packer`, `ssh-keygen` |
-| image build | `logs/build/<role>-commands/` | `apk`, `setup-disk` → `sfdisk`, `mkfs.ext4`, `mount`; `chroot`, `rc-update`, `adduser`, `update-extlinux`, `files.log` |
-| hub VM | `/var/log/lab/commands/` | `ip` (tenant bridges, Geneve tunnels per spoke), `virsh`, `ssh-keygen`, `wget` |
-| spoke VM | `/var/log/lab/commands/` | `ip` (bridge + tunnel per tenant), `virsh` (networks, guests incl. domain XML), `qemu-img` (guest disks), `wget` (join), `modprobe`, `hostname`, `files.log` (`interfaces`, `resolv.conf`) |
-
-```bash
-sudo ./cluster.sh logs collect            # bring the VMs' journals to this PC first
-sudo ./cluster.sh logs commands           # table: calls per tool x source (pc1, build:hub, hv101, ...)
-sudo ./cluster.sh logs commands qemu      # every QEMU start, all sources, in time order
-sudo ./cluster.sh logs commands mkfs      # how the disks were formatted (image build)
-less logs/nodes/hv101/lab/commands/all.log  # everything one spoke did, in order
-```
-
-**How it works.** `lab-trace` (in `common/rootfs/usr/local/lib/lab/`) is installed as
-symlinks named after the tools (`ip`, `virsh`, `mkfs.ext4`, ...) in a directory the lab
-scripts put first in `PATH` (`/usr/local/lib/lab/trace.d` on the VMs, `state/trace.d` on the
-lab PC). Each call is logged, then the real tool runs with the same arguments, input, output
-and exit code. Tools started by those tools are caught too — that is how `setup-disk`'s
-`sfdisk`/`mkfs`/`mount` appear. In the image build the records also go to the serial port,
-and `build.sh` files them on the lab PC.
-
-**What is left out (on purpose).** With `TRACE=changes` (default) calls that only read state
-are skipped (`ip ... show`, `virsh list/net-info`, the agent's 10 s state poll), and the
-`ensure_*` helpers only run a command when something differs — so a reconcile pass that finds
-everything in place adds nothing, and the journal shows changes only. Set `TRACE=all` in
-`cluster.conf` to see the read-only calls too, `TRACE_OUTPUT=yes` to also log each command's
-output, `TRACE=off` to disable (VMs: rebuild the images after changing these). Not journaled:
-`ssh` (the remote side journals what it runs), coreutils (`cp`, `cat`, ...), daemons started by
-OpenRC itself (`dnsmasq`, `httpd`, `udhcpc` from `networking`).
-
-## How a clone joins
-
-```
- spoke (fresh clone)                               hub
- ───────────────────                               ───
- boot: lab-net: 10.20.<ID>.1<NN>/16 from SMBIOS lab.ip (static; DHCP only if IP_MODE=dhcp)
- lab-agent boot: hostname spoke-<mac>, cached tunnels (none yet)
- POST /cgi-bin/join  token, mac, name, ssh hostkey ──▶  check token
-                                                     name = requested (lab.name) if free, else hvN
-                                                     address in use by another member? refuse
-                                                     DNS <name>.lab (+ DHCP pin in dhcp mode)
-                                                     trust its SSH host key
-                                                     g<VNI>-<name> for every tenant
- ◀── OK  NODE_NAME, NODE_IP, NODE_SECRET, hub SSH pubkey
- /etc/lab/node.env, hostname, authorize hub key
- every POLL (10 s; every 2 s until the first sync):
- POST /cgi-bin/state  name + secret ───────────────▶  must come from its own IP; marks it Ready
- ◀── TENANT acme 100 / TENANT beta 200 ...
- reconcile: br-t<VNI> + gnv<VNI> → hub, libvirt net tenant-<name>, prune removed tenants
-```
-
-- **Clone = stateless.** The image has no host keys, machine-id, name or node state; every
-  clone generates its own. `cluster.sh` gives each clone its own MAC, UUID and SMBIOS OEM
-  strings `lab.hub`, `lab.token`, `lab.name` — so the image itself carries no secret.
-- **Where the token comes from**, first match wins: `lab-agent join HUB TOKEN [NAME]`,
-  `/etc/lab/join.conf` (`HUB= TOKEN= NAME=`), SMBIOS. On bare metal, write `join.conf`.
-- **Only the join uses the token.** Afterwards each node has its own secret (like a kubelet
-  certificate). `hubctl token rotate` stops new joins with the old token without touching
-  members (copy the new token into `state/token` on every PC, or the next clones are refused).
-- **The hub talks back over SSH** (`hubctl vm add/del/console`, `hubctl exec`), with strict
-  host-key checking against keys collected at join time.
-- **Self-healing:** if the hub forgets a node (`hubctl node del`, lost state), the agent
-  re-joins under its old name on the next poll. A spoke that ran `lab-agent leave` stays out
-  until `lab-agent join`. If the hub is down, spokes keep their tunnels and rebuild them from
-  the cache at boot; same-host guest traffic keeps working.
-
-## Multi-PC
-
-All PCs share one underlay: each PC bridges a NIC (or a VLAN on a NIC) into its `br-under`,
-and all those NICs sit on the same switch/VLAN. The hub runs on the main PC only; every PC
-can run spokes. The protocol is plain IP (HTTP :8080, Geneve UDP 6081, SSH), so nothing
-else changes.
-
-**Requirements**
-- A **dedicated** network for the underlay: a separate switch, or a VLAN. With the default
-  static addressing nothing hands out addresses there, but the underlay still carries
-  unencrypted lab traffic and the join token — and with `IP_MODE=dhcp` the hub runs an
-  authoritative DHCP server on it. Never bridge the campus/office LAN.
-- The uplink NIC must have **no IP address** (use a second NIC or a VLAN like `enp1s0.20`).
-- The switch must pass **1600-byte frames** (`UNDERLAY_MTU`). If it doesn't, set
-  `UNDERLAY_MTU=1500` and `TENANT_MTU=1450` in `cluster.conf` on every PC and rebuild the images.
-- Nested KVM on every PC that runs spokes.
-
-**Main PC (host 1)**
-```bash
-sudo ./cluster.sh host init 1 enp2s0       # host.conf: host 1, main, uplink enp2s0
-sudo ./cluster.sh init && sudo ./cluster.sh build
-sudo ./cluster.sh up                        # br-under (+ enp2s0) and the hub
-sudo ./cluster.sh host export               # vdc-host-bundle.tar: kit + spoke image + token + key
-scp vdc-host-bundle.tar roy@pc2:            # keep it private: it contains the join token and SSH key
-```
-
-**Every other PC (host 2, 3, ...)**
-```bash
-mkdir vdc-cluster && tar xf vdc-host-bundle.tar -C vdc-cluster && cd vdc-cluster
-sudo ./cluster.sh host init 2 enp2s0       # host 2, worker, 10.20.2.1, uplink enp2s0
-sudo ./cluster.sh net-up                    # br-under + uplink
-sudo ./cluster.sh mtu-check                 # 1600-byte frames reach the hub?
-sudo ./cluster.sh spoke add 4               # hv201..hv204 = 10.20.2.101..104, joined to the hub on PC 1
-```
-
-| | main PC | worker PC |
-|---|---|---|
-| `host init` | `host init 1 [NIC]` | `host init <2..254> NIC` |
-| PC address | 10.20.1.1 | 10.20.*ID*.1 |
-| spoke names / addresses | hv101.. / 10.20.1.101.. | hv*ID*01.. / 10.20.*ID*.101.. |
-| spoke MACs | 52:54:00:21:01:NN | 52:54:00:21:*ID hex*:NN |
-| `init`, `up`, `host export`, `build` | yes | refused (`init`, `up`, `export`); build not needed |
-| `spoke add`, `start`, `stop`, `rm`, `list`, `logs` | yes | yes — checks the hub is reachable and the MTU first |
-| `hubctl`, `ssh NAME`, `logs collect` | any node | any node (through the underlay) |
-
-Tenants, guests and the scheduler are cluster-wide: `hubctl vm add acme r7` may place r7
-on hv203 in the next room.
-
-## Commands
-
-**hubctl** (on the hub, or `./cluster.sh hubctl ...` from any PC):
-
-| Command | What it does |
+| File | What |
 |---|---|
-| `nodes` | members, IP, MAC, Ready/NotReady (3 missed polls), guest count |
-| `node del NAME` / `node ip NAME` | evict (refused while it has guests) / address |
-| `token [rotate]` | join token |
-| `tenant del NAME` / `tenants` | tenant = VNI + bridge everywhere + subnet |
-| `tenant add NAME VNI [SUBNET]` | tenant subnet for the IPAM (default 192.168.<VNI>.0/24) |
+| `logs/cluster.log` | every `cluster.sh` run with its output |
+| `logs/vm/<name>.console.log` | each VM's serial console, all boots |
+| `logs/build/` | the image builds (Packer output, installer console) |
+| `logs/commands/<tool>.log` | every command `cluster.sh` ran on this PC (qemu, ip, ...) |
+| `logs/cloud/` | the cloud API (api, worker, meter, redis) |
+| `logs/nodes/<name>/` | logs copied from inside the VMs by `logs collect` |
+
+```bash
+sudo ./cluster.sh logs                    # list everything
+sudo ./cluster.sh logs tail hv101         # follow a VM's console as it boots
+sudo ./cluster.sh logs collect            # copy /var/log/lab from the hub and all spokes
+```
+
+### The command journal
+
+Every tool the lab uses to build things (`ip`, `virsh`, `qemu-img`, `mkfs`, `apk`, ...) is
+logged with the exact command line, who ran it, why, and the exit code:
+
+```
+2026-10-28 08:29:55 hv101 [lab-agent] $ ip link add gnv199 type geneve id 199 remote 10.20.0.2  # tunnel to the hub for tenant VNI 199
+2026-10-28 08:29:55 hv101 [lab-agent] = rc=0 0.01s ip
+```
+
+There is one file per tool plus `all.log` in order. You find it on the lab PC in
+`logs/commands/`, in each VM in `/var/log/lab/commands/`, and for the image build in
+`logs/build/<role>-commands/`. Passwords and the join token are masked. Commands that only read
+state are left out, so the journal shows only changes. Set `TRACE=all` in `cluster.conf` to
+include them, or `TRACE=off` to turn the journal off (rebuild the images after changing this).
+
+```bash
+sudo ./cluster.sh logs collect            # get the VMs' journals first
+sudo ./cluster.sh logs commands           # how many calls per tool and machine
+sudo ./cluster.sh logs commands qemu      # every QEMU start, in time order
+```
+
+
+## How a spoke joins
+
+1. At boot, `lab-net` gives the spoke its address. `cluster.sh` passes the address to QEMU,
+   and from there it reaches the spoke.
+2. `lab-agent` sends the join token, its MAC and its SSH host key to the hub (`POST /cgi-bin/join`
+   on port 8080).
+3. The hub checks the token and registers the spoke. It builds a tunnel to it for every tenant,
+   and answers with the spoke's name and a secret of its own.
+4. From then on the agent asks the hub every 10 seconds which tenants exist (using its secret,
+   not the token). It creates the tenant bridges, tunnels and libvirt networks itself.
+
+A spoke that misses three polls shows as NotReady. If the hub forgets a spoke, the spoke joins
+again under its old name. If the hub is down, spokes keep their tunnels, and guests on the same
+spoke can still talk to each other.
+
+
+## Settings
+
+All settings are in `cluster.conf`, and are copied into the images when you build them.
+Rebuild after changing anything except the `CLOUD_*` lines.
+
+| Setting | Default | |
+|---|---|---|
+| `ROOT_PASSWORD` | `vdclab` | console login of hub and spokes |
+| `GUEST_PASSWORD` | `vdclab` | login of tenant guests |
+| `HUB_MEM`, `SPOKE_MEM` | 2048 | MB of RAM per VM |
+| `DISK_SIZE` | 20G | disk of hub and spokes (sparse) |
+| `UNDERLAY_NET`, `HUB_IP`, `LABPC_IP` | 10.20.0.0/16, 10.20.0.2, 10.20.1.1 | the lab's own network |
+| `UNDERLAY_MTU` | 1600 | must pass the switch in multi-PC setups |
+| `HUB_SCHEDULABLE` | yes | the hub also runs guests |
+| `GUEST_HOST_RESERVE` | 512 | MB of each node's RAM never given to guests |
+| `TRACE` | changes | command journal: `changes`, `all` or `off` |
+| `CLOUD_PORT` | 36100 | the cloud API |
+
+Settings that differ per PC (host ID, uplink NIC) are in `host.conf`, written by `host init`.
+
+
+## Command reference
+
+`cluster.sh` (on a lab PC, with sudo):
+
+| Command | |
+|---|---|
+| `init` | SSH key and join token; resets `br-under` and the VMs' network ports |
+| `build [hub\|spoke]` | build the images |
+| `up` | start the hub |
+| `spoke add [N]` | add N spokes |
+| `list` | VMs on this PC and the cluster's members |
+| `start\|stop NAME\|all`, `rm NAME` | power a VM on or off, remove it |
+| `console NAME`, `ssh NAME [CMD]` | serial console (Ctrl-] leaves), SSH |
+| `hubctl ARGS` | run hubctl on the hub |
+| `image add NAME FILE\|URL`, `images` | guest images |
+| `capture NAME [FILTER]` | tcpdump on a VM's network port |
+| `logs`, `logs tail NAME`, `logs collect`, `logs commands [TOOL]` | logs and the command journal |
+| `host init ID [NIC]`, `host show`, `host export` | multi-PC setup |
+| `net-up`, `net-down`, `mtu-check` | the underlay network |
+| `cloud install\|start\|stop\|status\|logs\|admin\|enable\|disable\|test` | the cloud API |
+
+`hubctl` (through `cluster.sh hubctl`, or on the hub itself):
+
+| Command | |
+|---|---|
+| `nodes`, `node del NAME` | members and their state; remove one |
+| `tenant add NAME VNI [SUBNET]`, `tenant del NAME`, `tenants` | tenant networks |
 | `ips [TENANT]` | address allocations and the next free one |
-| `image add NAME URL\|--file PATH [--type] [--mem] [--disk] [--user]` / `image del` / `images` | tenant image catalog (`./cluster.sh image add` uploads from the lab PC) |
-| `vm add TENANT NAME [NODE] [--image] [--ip] [--mem] [--disk] [--cpus]` | guest; address from the IPAM, node = most free RAM (hub included if `HUB_SCHEDULABLE=yes`) |
-| `vm info NAME` / `vm del` / `vm console` / `vms` | image, address, MAC, node, login / remove (address released) |
-| `exec NODE CMD...` | run on any node |
-| `apply` | rebuild the hub side of the overlay |
+| `vm add TENANT NAME [NODE] [--image I] [--ip A] [--mem MB] [--cpus N] [--disk SIZE]` | create a guest |
+| `vm info NAME`, `vm console NAME`, `vm del NAME`, `vms` | guests |
+| `image add NAME URL`, `image del NAME`, `images` | the image catalog |
+| `token` | the join token |
+| `exec NODE CMD` | run a command on any node |
 
-**cluster.sh cloud** (main PC): `install [--dev]`, `start`, `stop`, `restart`, `status`,
-`logs [api|worker|meter|redis]`, `admin`, `enable` / `disable` (systemd), `test`.
+On a spoke, `lab-agent status` shows its view of the cluster.
 
-**lab-agent** (on a spoke): `status`, `sync`, `join [HUB [TOKEN [NAME]]]`, `leave`.
-**lab-guest** (any node): `add`, `del`, `list`.
 
 ## Exercises
 
-**E1 — Watch a node join.** `./cluster.sh capture hub 'tcp port 8080'` in one terminal,
-`./cluster.sh spoke add` in another. Match the packets to the progress lines. What is the
-only secret in the join request, and what replaces it afterwards?
+**E1: Watch a spoke join.** Run `sudo ./cluster.sh capture hub 'tcp port 8080'` in one
+terminal and `sudo ./cluster.sh spoke add` in another. Match the packets to the progress lines.
+What is the only secret in the join request, and what replaces it afterwards?
 
-**E2 — The scheduler.** Create 6 guests without a node. Predict where each lands
-(`hubctl vms`). Then stop a spoke (`./cluster.sh stop hv102`); how long until `hubctl nodes`
-shows NotReady, and where does the next guest go?
+**E2: The scheduler.** Create six guests without naming a spoke and predict where each one
+lands. Then stop a spoke. How long until `hubctl nodes` shows it NotReady, and where does the
+next guest go?
 
-**E3 — Scale out under traffic.** Ping r1 → r2 (different hosts) while running
-`./cluster.sh spoke add 2`. Does the ping notice? Count `hubctl tenants` tunnels before/after.
+**E3: Scale out under traffic.** Keep a ping running between two guests on different spokes,
+and add two spokes. Does the ping notice? Compare `hubctl tenants` before and after.
 
-**E4 — Lose the control plane's memory.** On the hub: `cp /var/lib/lab/nodes /root/; : > /var/lib/lab/nodes; hubctl apply`.
-Watch `hubctl nodes` for 20 s, then `logs collect` and read the agents' `agent.log`.
-Who rebuilt the registry, and why did every node keep its name?
+**E4: The hub forgets.** On the hub, empty the member list: `cp /var/lib/lab/nodes /root/; :
+> /var/lib/lab/nodes; hubctl apply`. Watch `hubctl nodes` for 20 seconds, then read the
+agents' `agent.log`. Who rebuilt the list, and why did every spoke keep its name?
 
-**E5 — Hub as single point of failure.** `./cluster.sh stop hub` while guests ping each
-other on the same host and across hosts. Which traffic survives? Reboot a spoke while the
-hub is down and follow it (`./cluster.sh start hv101`) — which progress steps appear, which
-don't, and does it still have its `gnv*` tunnels?
+**E5: The hub goes down.** Stop the hub while guests ping each other on the same spoke and
+across spokes. Which traffic survives? Reboot a spoke while the hub is down: which progress
+steps appear, and does it still have its tunnels?
 
-**E6 — Join security.** Boot a spoke with the wrong token (edit `/etc/lab/join.conf`,
-`lab-agent join`) and find the refusal in three logs: the console, `agent.log`, `hub.log`.
-Then, from a joined spoke, call `/cgi-bin/state` with another node's name. Which checks stop
-you? What could an attacker on the underlay still do?
+**E6: Join security.** Make a spoke join with a wrong token and find the refusal on its console,
+in its `agent.log` and in the hub's `hub.log`. Then, from a joined spoke, call `/cgi-bin/state`
+pretending to be another spoke. What stops you? What could an attacker on the underlay still do?
 
-**E7 — Two rooms, one cluster (multi-PC).** Add spokes from a second PC. Capture on its
-`UPLINK_NIC`: which traffic crosses the switch when a guest on hv201 pings one on hv101?
-Then shrink `UNDERLAY_MTU` to 1500 on one side only (without rebuilding) and explain what
-`mtu-check` and a large `ping -s 1472` between guests show.
+**E7: Two rooms (multi-PC).** Add spokes from a second PC. Capture on its uplink NIC: what
+crosses the switch when a guest on hv201 pings one on hv101? Then set `UNDERLAY_MTU` to 1500 on
+one side only and explain what `mtu-check` and `ping -s 1472` between guests show.
 
-**E8 — Read the build.** Without opening any script: from `logs/build/spoke-commands/all.log`
-and `files.log`, write down the steps that turn an empty disk into a spoke image (partition,
-filesystem, packages, services, config files). Then from `logs/commands/qemu.log` explain every
-option of one spoke's QEMU command line, and from that spoke's journal, the order in which its
-tenant bridge, tunnel and libvirt network were created — and why that order.
+**E8: Read the build.** Using only `logs/build/spoke-commands/all.log` and `files.log`, write
+down how an empty disk becomes a spoke image. Explain every option of one spoke's QEMU command
+line from `logs/commands/qemu.log`.
 
-**E9 — Same image, two guests, two addresses.** `image add` an Ubuntu cloud image, create
-two guests from it in one tenant, and find in the journals: the base download (once per node),
-the two `qemu-img create -b` overlays, the two seeds (`files.log`: which lines differ?), and
-the `virsh define` with the CD-ROM. Inside a guest: `cloud-init status --long`,
-`cat /etc/netplan/*.yaml` — where did the address come from? Then `hubctl vm del` one guest and
-create a third: which address does it get, and why?
+**E9: One image, two guests.** Add an Ubuntu image and create two guests from it. Find the
+download, the two disk overlays, the two cloud-init seeds and the `virsh define` calls in the
+journals. Inside a guest, where did its address come from? Delete one guest and create a third:
+which address does it get?
+
+**E10: Tenant self-service.** As the provider, create tenant-a and tenant-b in the cloud API.
+As alice, create VMs until the quota stops you. As an auditor, find that refusal in
+`/audit/events`. Then match each accepted `vm.create` to its `virsh start` in
+`/audit/journal?node=hv101&tool=virsh`. What would a VM created with `hubctl` directly look
+like in the two logs?
+
 
 ## Troubleshooting
 
-| Symptom | Check |
+| Problem | What to check |
 |---|---|
-| progress stops at "booting" | `./cluster.sh logs tail NAME`; no nested KVM → very slow (`warning: no KVM` at start) |
-| `! underlay address not configured` | static mode: VM not started by `cluster.sh` (no SMBIOS `lab.ip`) or bare metal without `IP=` in `join.conf`; `net.log` |
-| `! waiting for a DHCP lease` | `IP_MODE=dhcp` only: hub's `dnsmasq.log`; worker: `mtu-check`, cabling, VLAN |
-| `! join refused: ERROR ip-in-use by X` | two machines on one address: fix `IP=` / `HOST_ID`, or `hubctl node del X` if X is gone |
-| `! join failed: hub ... unreachable` | hub API: `api.log`; worker: `./cluster.sh mtu-check` |
-| lab PC reaches hub and spokes, but a spoke cannot ping the hub | the lab PC's firewall drops bridged frames (Docker/ufw + `br_netfilter`): `sysctl net.bridge.bridge-nf-call-iptables`, `iptables -S FORWARD`; `cluster.sh` adds `iptables -I FORWARD -i br-under -o br-under -j ACCEPT` |
-| `ssh NAME` says unknown node | the node has not joined; `ssh` falls back to the VM's own IP on its PC |
-| `! join refused: ERROR bad-token` | `hubctl token` vs `state/token` on this PC; the hub takes SMBIOS `lab.token` at boot |
-| node NotReady | `lab-agent status` on it, `agent.log`; hub reachable? |
-| `cloud start`: API does not answer | `./cluster.sh cloud logs api`; port `CLOUD_PORT` in use? |
-| cloud: jobs stay `queued` | worker not running (`cloud status`), Redis down (`cloud logs redis`) |
-| cloud: `502 cluster: hub not reachable` | the hub VM is down or `state/id_lab` does not match the images (`./cluster.sh list`) |
-| `vm add` fails on a spoke | `hubctl exec NODE lab-guest list`, `guest.log`, that node's `commands/all.log`; `hubctl images` |
-| `no Ready node has N MB RAM free` | `hubctl nodes` (free/total); smaller `--mem`, more spokes, or bigger `SPOKE_MEM` |
-| guest has no address | `hubctl vm info NAME` (type `none` gets no seed); inside: `cloud-init status --long`; the seed in that node's `files.log` |
-| `checksum mismatch` on vm add | the hub's image file changed outside `image add`; re-run `image add` |
-| guests on different hosts can't talk | `hubctl tenants` shows a tunnel per node? `bridge fdb show br br-t<VNI>` on the hub; MTU on br-under, taps, uplink, switch |
-| worker: `cannot reach the hub` | main PC up, `UPLINK_NIC` set (`host show`), same switch/VLAN, `net-up` done |
-| image build fails | the failing step is shown; full detail in `logs/build/<role>.console.log` |
-| `build` refuses | linked clones depend on the base image: `./cluster.sh rm` them, or `FORCE=1` and accept breakage |
-
-## Differences from HUB-SPOKE-INFRA
-
-| HUB-SPOKE-INFRA | vdc-cluster |
-|---|---|
-| roles `mgmt` / `hv`, one kit dir | `hub/` and `spoke/` folders, shared `common/` |
-| fixed `HOSTS`/`SPOKES` list, `hvN = .1N`, /24 | join registry on the hub; static /16 plan `10.20.<PC>.<100+N>`, DHCP opt-in |
-| adding a host: edit config, `init`, `sync` | `./cluster.sh spoke add` (clone + boot, with progress) |
-| `tenant.sh` on the lab PC pushes state | hub is the source of truth, spokes pull |
-| guests created by the lab PC | `hubctl vm add` with placement, hub also schedulable |
-| one PC | any number of PCs on one switch (`host init`, `host export`) |
-| logs scattered | everything in `logs/`, in-VM logs in `/var/log/lab/` + `logs collect` |
-
-## Status
-
-Tested in a sandbox: real `hubctl` and `lab-agent`, with `ip`, `virsh`, `ssh` and the HTTP
-transport stubbed (the spoke's requests go straight into `hubctl _api`). Covered: join and
-token checks, name assignment and collisions, hub/spoke tunnels, DHCP/DNS/known_hosts
-registry, scheduler, rollback of failed guest creation, refusals while guests exist,
-tenant images (catalog, upload/convert, checksum-keyed node cache, mismatch refusal, overlay
-sizing), the IPAM (allocation order, explicit `--ip` checks, release and reuse, /29 exhaustion,
-rollback on failed creation), memory-aware placement, seed files (cloud-init user-data and
-network-config parsed as YAML, CirrOS script syntax), domain XML, password masking in the
-journal, registry loss and re-join under the old name, duplicate-address refusal (static) vs lease
-reuse (dhcp), `lab-net` for clone / bare-metal / forced-DHCP / dhcp-mode / missing / bad
-address, the SMBIOS `lab.ip` passed to QEMU, tenant add/delete propagation, eviction and
-auto re-join, clean leave, NotReady detection, boot with the hub down, API input validation;
-the agent's console progress for no-address / hub-down / bad-token / re-join cases; the
-`cluster.sh` progress watcher on replayed serial logs (incl. timeout); `build.sh` progress
-and early abort with a fake Packer; `host init/show/export`, worker restrictions; the command
-journal: wrapper (exit codes, stdin, nesting, PID kept for `packer`, read-only filter,
-`TRACE=off/all`, output capture, token masking, no loop with two wrapper dirs), journals of a
-real agent/hub join, zero new entries in steady state, lab PC journal of a VM's create/start/
-stop, the build's journal carried over the console, and the merged `logs commands` view.
-All scripts pass shellcheck.
-
-**Not yet run on real VMs or real NICs** (Packer build, OpenRC ordering, busybox httpd +
-doas CGI path, nested libvirt, uplink/VLAN bridging, multi-PC over a real switch, Ubuntu and
-CirrOS actually reading the seed ISO — CirrOS's NoCloud support is the one to check first).
-Storage is still to be designed.
+| a VM stays at "booting" | `sudo ./cluster.sh logs tail NAME`; without nested KVM everything is very slow |
+| `hub VM runs but does not answer SSH` | the images were built with another key: `rm` the VMs, `build`, `up` |
+| `join failed: hub ... unreachable` | `sudo ./cluster.sh mtu-check`; on the hub, `/var/log/lab/api.log` |
+| the PC reaches hub and spokes, but a spoke can't reach the hub | a firewall on the PC (Docker, ufw) drops bridged traffic; `cluster.sh` adds `iptables -I FORWARD -i br-under -o br-under -j ACCEPT`, or run that yourself |
+| `join refused: ERROR bad-token` | `state/token` changed after the build; rebuild, or `hubctl token` to compare |
+| `join refused: ERROR ip-in-use by X` | two machines with one address; if X is gone, `hubctl node del X` |
+| a spoke is NotReady | `lab-agent status` and `/var/log/lab/agent.log` on it |
+| `no Ready node has N MB RAM free` | `hubctl nodes`; use a smaller `--mem`, more spokes or a bigger `SPOKE_MEM` |
+| a guest has no address | `hubctl vm info NAME` (type `none` gets none); inside, `cloud-init status --long` |
+| guests on different spokes can't talk | `hubctl tenants` should list a tunnel per spoke; check the MTU on the switch |
+| `build` refuses | VMs still use the old image: `rm` them first |
+| a worker PC can't reach the hub | the main PC is up, `host show` lists the uplink NIC, same switch or VLAN, `net-up` done |
+| cloud API doesn't answer | `sudo ./cluster.sh cloud logs api`; is port 36100 taken? |
+| cloud jobs stay queued | `sudo ./cluster.sh cloud status`: the worker or Redis is not running |
