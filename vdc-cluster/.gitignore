@@ -21,3 +21,7 @@ logs/
 *~
 *.swp
 .DS_Store
+
+# --- cloud API (code in cloud/, data in state/cloud/)
+__pycache__/
+.pytest_cache/

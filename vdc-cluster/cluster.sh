@@ -20,6 +20,14 @@
 #   ./cluster.sh logs collect [NAME|all] copy /var/log/lab etc. from nodes into logs/nodes/
 #   ./cluster.sh logs commands [TOOL]    command journal: per-tool counts, or every TOOL call
 #
+# cloud API (cloud/, main PC): NIST CCRA REST API for providers, tenants and auditors
+#   ./cluster.sh cloud install [--dev]   Python venv + Redis + secrets in state/cloud/
+#   ./cluster.sh cloud start|stop|restart|status
+#   ./cluster.sh cloud logs [api|worker|meter|redis]
+#   ./cluster.sh cloud admin             the provider login
+#   ./cluster.sh cloud enable|disable    run it under systemd (survives reboots)
+#   ./cluster.sh cloud test              the API's test suite (stand-in hub, no cluster needed)
+#
 # multi-PC:
 #   ./cluster.sh host init ID [NIC]      this PC's identity -> host.conf (ID 1 = main PC)
 #   ./cluster.sh host show
@@ -630,11 +638,185 @@ EOF
   esac
 }
 
+# ---------------------------------------------------------------- cloud API (cloud/)
+# The FastAPI service in cloud/ (NIST CCRA: /tenant /provider /audit /carrier) runs on the main
+# PC next to the kit. Code in cloud/; everything it creates in state/cloud/ and logs/cloud/.
+CLOUD=$KIT/cloud
+CST=$ST/cloud
+CVENV=$CST/venv
+: "${CLOUD_PORT:=36100}" "${CLOUD_BIND:=0.0.0.0}" "${CLOUD_ADMIN_USER:=admin}"
+: "${CLOUD_REDIS_URL:=redis://127.0.0.1:6379/1}" "${CLOUD_VNI_MIN:=100}" "${CLOUD_VNI_MAX:=254}"
+: "${CLOUD_SUBNET_TEMPLATE:=10.{vni}.20.0/24}" "${CLOUD_METER_MINUTES:=5}"
+CLOUD_PROCS="api worker meter"
+
+cloud_env_file() {   # state/cloud/cloud.env: the processes' settings (also the systemd EnvironmentFile)
+  ( umask 077
+    cat >"$CST/cloud.env" <<ENV
+VDC_KIT=$KIT
+VDC_HUB=$HUB_IP
+VDC_DB=sqlite:///$CST/cloud.db
+REDIS_URL=$CLOUD_REDIS_URL
+VDC_QUEUE=vdc-cloud
+VDC_JWT_SECRET=$(cat "$CST/jwt-secret")
+VDC_ADMIN_USER=$CLOUD_ADMIN_USER
+VDC_ADMIN_PASSWORD=$(cat "$CST/admin-password")
+VDC_VNI_MIN=$CLOUD_VNI_MIN
+VDC_VNI_MAX=$CLOUD_VNI_MAX
+VDC_SUBNET_TEMPLATE=$CLOUD_SUBNET_TEMPLATE
+VDC_METER_MINUTES=$CLOUD_METER_MINUTES
+VDC_SUDO=
+ENV
+  )
+}
+
+cloud_cmd() {   # PROC -> the command line of one process
+  case $1 in
+    api)    echo "$CVENV/bin/uvicorn app.main:app --host $CLOUD_BIND --port $CLOUD_PORT" ;;
+    worker) echo "$CVENV/bin/rq worker vdc-cloud --url $CLOUD_REDIS_URL" ;;
+    meter)  echo "$CVENV/bin/python -m app.metering" ;;
+  esac
+}
+
+cloud_pid() { local p=$CST/$1.pid; [ -f "$p" ] && kill -0 "$(cat "$p")" 2>/dev/null && cat "$p"; }
+cloud_systemd() { systemctl is-active --quiet "vdc-cloud-$1" 2>/dev/null; }
+redis_up() { "$CVENV/bin/python" -c "import redis,sys; redis.from_url(sys.argv[1]).ping()" "$CLOUD_REDIS_URL" 2>/dev/null; }
+
+cloud_redis() {   # a reachable Redis: the system's, or one of our own on 127.0.0.1:6379
+  redis_up && { echo "  redis   ok ($CLOUD_REDIS_URL)"; return 0; }
+  systemctl start redis-server 2>/dev/null || systemctl start redis 2>/dev/null || true
+  sleep 1; redis_up && { echo "  redis   system service started"; return 0; }
+  command -v redis-server >/dev/null || die "no Redis: ./cluster.sh cloud install (or set CLOUD_REDIS_URL)"
+  case $CLOUD_REDIS_URL in redis://127.0.0.1:6379/*|redis://localhost:6379/*) ;;
+    *) die "Redis at $CLOUD_REDIS_URL does not answer" ;; esac
+  redis-server --bind 127.0.0.1 --port 6379 --daemonize yes --dir "$CST" \
+    --pidfile "$CST/redis.pid" --logfile "$LOGS/cloud/redis.log" --save 60 1
+  sleep 1; redis_up || die "Redis did not start (logs/cloud/redis.log)"
+  echo "  redis   own instance, data in state/cloud/dump.rdb"
+}
+
+cloud_unit() {   # PROC -> systemd unit text
+  cat <<UNIT
+[Unit]
+Description=vdc-cloud $1 ($KIT)
+After=network-online.target redis-server.service
+
+[Service]
+EnvironmentFile=$CST/cloud.env
+WorkingDirectory=$CLOUD
+ExecStart=$(cloud_cmd "$1")
+StandardOutput=append:$LOGS/cloud/$1.log
+StandardError=append:$LOGS/cloud/$1.log
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+cmd_cloud() {
+  [ "$HOST_ROLE" = main ] || die "the cloud API runs on the main PC (it drives the hub)"
+  mkdir -p "$CST" "$LOGS/cloud"; chmod 700 "$CST"
+  local p pid i
+  case ${1:-status} in
+    install)
+      echo "== cloud install: Python venv in state/cloud/venv, Redis, secrets"
+      if ! python3 -c 'import venv, ensurepip' 2>/dev/null || ! command -v redis-server >/dev/null; then
+        if command -v apt-get >/dev/null; then
+          echo "  apt-get install python3-venv redis-server"
+          DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv redis-server >/dev/null ||
+            die "apt-get install python3-venv redis-server failed"
+        else
+          echo "  note: install Python venv support and redis-server with your package manager"
+        fi
+      fi
+      [ -x "$CVENV/bin/python" ] || python3 -m venv "$CVENV"
+      echo "  pip install -r cloud/requirements.txt"
+      "$CVENV/bin/pip" install -q --upgrade pip
+      "$CVENV/bin/pip" install -q -r "$CLOUD/requirements.txt"
+      if [ "${2:-}" = --dev ]; then "$CVENV/bin/pip" install -q -r "$CLOUD/requirements-dev.txt"; fi
+      [ -s "$CST/jwt-secret" ] || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$CST/jwt-secret"
+      [ -s "$CST/admin-password" ] || head -c 12 /dev/urandom | base64 | tr -d '/+=' | cut -c1-14 >"$CST/admin-password"
+      chmod 600 "$CST/jwt-secret" "$CST/admin-password"
+      cloud_env_file
+      echo "installed. provider login: $CLOUD_ADMIN_USER / $(cat "$CST/admin-password")  (state/cloud/admin-password)"
+      echo "next: ./cluster.sh cloud start" ;;
+    start)
+      [ -x "$CVENV/bin/uvicorn" ] || die "not installed: ./cluster.sh cloud install"
+      cloud_env_file
+      echo "== cloud start"
+      cloud_redis
+      for p in $CLOUD_PROCS; do
+        if cloud_systemd "$p"; then echo "  $p  runs under systemd (vdc-cloud-$p)"; continue; fi
+        if pid=$(cloud_pid "$p"); then echo "  $p  already running (pid $pid)"; continue; fi
+        # shellcheck disable=SC2046
+        (cd "$CLOUD" && set -a && . "$CST/cloud.env" && set +a &&
+          exec setsid $(cloud_cmd "$p") >>"$LOGS/cloud/$p.log" 2>&1 </dev/null) &
+        echo $! >"$CST/$p.pid"
+        echo "  $p  started (pid $!, log logs/cloud/$p.log)"
+      done
+      for i in $(seq 20); do
+        "$CVENV/bin/python" -c "import urllib.request,sys; urllib.request.urlopen(sys.argv[1], timeout=2)" \
+          "http://127.0.0.1:$CLOUD_PORT/" 2>/dev/null && break
+        sleep 1
+      done
+      [ "$i" -lt 20 ] || die "the API does not answer on port $CLOUD_PORT: tail logs/cloud/api.log"
+      echo "cloud API up: http://$LABPC_IP:$CLOUD_PORT/docs   (provider: $CLOUD_ADMIN_USER / $(cat "$CST/admin-password"))" ;;
+    stop)
+      for p in $CLOUD_PROCS; do
+        if pid=$(cloud_pid "$p"); then kill "$pid" 2>/dev/null || true; echo "  $p  stopped"; fi
+        rm -f "$CST/$p.pid"
+      done
+      if [ -f "$CST/redis.pid" ] && kill -0 "$(cat "$CST/redis.pid")" 2>/dev/null; then
+        kill "$(cat "$CST/redis.pid")"; echo "  redis   own instance stopped"
+      fi ;;
+    restart) cmd_cloud stop; cmd_cloud start ;;
+    status)
+      [ -x "$CVENV/bin/python" ] || { echo "cloud API: not installed (./cluster.sh cloud install)"; return 0; }
+      for p in $CLOUD_PROCS; do
+        if cloud_systemd "$p"; then echo "  $p  running (systemd vdc-cloud-$p)"
+        elif pid=$(cloud_pid "$p"); then echo "  $p  running (pid $pid)"
+        else echo "  $p  stopped"; fi
+      done
+      if redis_up; then echo "  redis   ok ($CLOUD_REDIS_URL)"; else echo "  redis   not reachable ($CLOUD_REDIS_URL)"; fi
+      echo "  url     http://$LABPC_IP:$CLOUD_PORT/docs" ;;
+    logs)
+      p=${2:-api}
+      case " $CLOUD_PROCS redis " in *" $p "*) ;; *) die "usage: $0 cloud logs [api|worker|meter|redis]" ;; esac
+      exec tail -n 40 -F "$LOGS/cloud/$p.log" ;;
+    admin) echo "provider login: $CLOUD_ADMIN_USER / $(cat "$CST/admin-password" 2>/dev/null || echo '(not installed)')" ;;
+    enable)   # the three processes under systemd: they survive reboots
+      [ -x "$CVENV/bin/uvicorn" ] || die "not installed: ./cluster.sh cloud install"
+      command -v systemctl >/dev/null || die "no systemd on this PC: use ./cluster.sh cloud start"
+      cloud_env_file
+      cmd_cloud stop >/dev/null
+      for p in $CLOUD_PROCS; do cloud_unit "$p" >"/etc/systemd/system/vdc-cloud-$p.service"; done
+      systemctl enable --now redis-server 2>/dev/null || systemctl enable --now redis 2>/dev/null ||
+        echo "  warning: no Redis service; the API needs $CLOUD_REDIS_URL"
+      systemctl daemon-reload
+      for p in $CLOUD_PROCS; do systemctl enable --now "vdc-cloud-$p" >/dev/null 2>&1; done
+      echo "systemd: vdc-cloud-api, vdc-cloud-worker, vdc-cloud-meter enabled and started"
+      echo "  note: the hub VM is not started at boot; after a reboot run ./cluster.sh up" ;;
+    disable)
+      for p in $CLOUD_PROCS; do
+        systemctl disable --now "vdc-cloud-$p" 2>/dev/null || true
+        rm -f "/etc/systemd/system/vdc-cloud-$p.service"
+      done
+      systemctl daemon-reload 2>/dev/null || true
+      echo "systemd units removed (start by hand: ./cluster.sh cloud start)" ;;
+    test)
+      [ -x "$CVENV/bin/python" ] || die "not installed: ./cluster.sh cloud install --dev"
+      [ -x "$CVENV/bin/pytest" ] || "$CVENV/bin/pip" install -q -r "$CLOUD/requirements-dev.txt"
+      (cd "$CLOUD" && "$CVENV/bin/pytest" -q -p no:cacheprovider tests) ;;
+    *) die "usage: $0 cloud install [--dev]|start|stop|restart|status|logs [PROC]|admin|enable|disable|test" ;;
+  esac
+}
+
 ARGS=("$@")
 check_host
 case ${1:-help} in
   console|ssh|hubctl|capture|help|-h|--help) ;;
   logs) if [ "${2:-}" != tail ] && [ "${2:-}" != commands ]; then need_root; start_log "$*"; fi ;;
+  cloud) need_root; case ${2:-status} in logs|status|admin) ;; *) start_log "$*" ;; esac ;;
   *) need_root; start_log "$*"; trace_setup "$@" ;;
 esac
 case ${1:-help} in
@@ -643,6 +825,7 @@ case ${1:-help} in
   net-up) cmd_net_up ;;
   net-down) cmd_net_down ;;
   mtu-check) cmd_mtu_check "${2:-}" ;;
+  cloud) shift; cmd_cloud "$@" ;;
   up) cmd_up ;;
   spoke) [ "${2:-}" = add ] || die "usage: $0 spoke add [COUNT]"; cmd_spoke_add "${3:-1}" ;;
   start) [ -n "${2:-}" ] || die "usage: $0 start NAME|all"; cmd_start "$2" ;;
@@ -664,6 +847,6 @@ case ${1:-help} in
   images) cmd_image list ;;
   capture) need_root; [ -n "${2:-}" ] || die "usage: $0 capture NAME [FILTER]"
     n=$2; shift 2; exec tcpdump -ni "tap-$n" "$@" ;;
-  help|-h|--help) sed -n '2,31s/^# \{0,1\}//p' "$0" ;;
+  help|-h|--help) sed -n '2,39s/^# \{0,1\}//p' "$0" ;;
   *) sed -n '2,31s/^# \{0,1\}//p' "$0"; exit 1 ;;
 esac

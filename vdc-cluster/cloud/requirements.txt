@@ -1,0 +1,7 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+sqlmodel>=0.0.22
+pyjwt>=2.8
+python-multipart>=0.0.9
+redis>=5.0
+rq>=1.16

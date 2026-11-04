@@ -49,12 +49,13 @@ from its name, on one /16:
 | `cluster.conf` | every PC + baked into both images as `/etc/lab/cluster.env` | addressing, sizes, versions, timeouts |
 | `host.conf` | this PC only (written by `host init`) | `HOST_ID`, `HOST_ROLE`, `LABPC_IP`, `UPLINK_NIC` |
 | `cluster.sh` | every PC | init, build, up, `spoke add N`, start/stop, rm, list, console, ssh, logs, host, mtu-check |
+| `cloud/` | main PC (`cluster.sh cloud ...`) | the cloud API: FastAPI, organised by NIST CCRA (see Cloud API) |
 | `common/` | both images | `setup-base.sh`; `lib.sh` (bridge/tunnel/libvirt helpers), `lab-guest` |
 | `hub/` | hub image | `setup.sh`, `hubctl`, services `lab-hub` + `lab-api`, CGI `join/state/leave` |
 | `spoke/` | spoke image | `setup.sh`, `lab-net` (underlay address at boot), `lab-agent` + services |
 | `image/` | main PC | `alpine-install.sh`, `alpine.pkr.hcl`, `build.sh` → `images/hub.qcow2`, `images/spoke.qcow2` |
 | `logs/` | every PC | **all logs** (see Logs) |
-| `state/` | every PC | lab SSH key, join token, VM disks (`state/vms/`) |
+| `state/` | every PC | lab SSH key, join token, VM disks (`state/vms/`); main PC also `state/cloud/` (API database, secrets, venv) |
 
 The `*/setup.sh` scripts also work on an already-installed Alpine machine
 (`KIT=/root/vdc-cluster sh spoke/setup.sh`, then reboot) — e.g. a bare-metal spoke.
@@ -85,6 +86,40 @@ Grow later: `sudo ./cluster.sh spoke add 2` → hv104, hv105; every tenant gets 
 tunnels automatically. Shrink: `hubctl vm del ...` for its guests, then `sudo ./cluster.sh rm hv105`.
 
 Spoke names are `hv<HOST_ID><NN>`: hv101 is spoke 1 on PC 1 (10.20.1.101), hv201 spoke 1 on PC 2 (10.20.2.101).
+
+Self-service through the cloud API instead of `hubctl` (see Cloud API):
+
+```bash
+sudo ./cluster.sh cloud install && sudo ./cluster.sh cloud start   # http://10.20.1.1:36100/docs
+```
+
+## Cloud API
+
+`cloud/` is a REST API on top of the cluster, organised by the NIST Cloud Computing Reference
+Architecture (SP 500-292). Each CCRA actor has its own part of the API and its own role:
+
+| Prefix | CCRA actor | Role | Can do |
+|---|---|---|---|
+| `/tenant` | Cloud Consumer | `consumer` | its own tenant only: VMs, network, jobs, usage, members |
+| `/provider` | Cloud Provider | `provider` | onboard tenants (VNI + subnet from a pool), quotas, flavors, images, spokes, every tenant's VMs |
+| `/audit` | Cloud Auditor | `auditor` | read only: audit log, reports, metering, the command journal of any node |
+| `/carrier` | Cloud Carrier | `provider`, `auditor` | underlay health |
+
+It drives the cluster only through `hubctl` (over SSH with `state/id_lab`) and `cluster.sh`, so
+the hub still allocates addresses, places VMs and builds the tunnels. The API adds what the hub
+doesn't know: users and roles, tenant ownership, quotas, flavors and prices, jobs, an audit log,
+and usage metering.
+
+```bash
+sudo ./cluster.sh cloud install            # Python venv + Redis + secrets in state/cloud/
+sudo ./cluster.sh cloud start              # api, job worker, usage meter; logs in logs/cloud/
+sudo ./cluster.sh cloud admin              # provider login: admin / <generated>
+# open http://<LABPC_IP>:36100/docs -> Authorize -> try POST /provider/tenants
+sudo ./cluster.sh cloud enable             # optional: systemd, survives reboots
+```
+
+Settings are the `CLOUD_*` lines in `cluster.conf`. Endpoints, rules, the CCRA mapping and a
+curl walk-through are in `cloud/README.md`. The API runs on the main PC only.
 
 ## Progress
 
@@ -378,6 +413,9 @@ on hv203 in the next room.
 | `exec NODE CMD...` | run on any node |
 | `apply` | rebuild the hub side of the overlay |
 
+**cluster.sh cloud** (main PC): `install [--dev]`, `start`, `stop`, `restart`, `status`,
+`logs [api|worker|meter|redis]`, `admin`, `enable` / `disable` (systemd), `test`.
+
 **lab-agent** (on a spoke): `status`, `sync`, `join [HUB [TOKEN [NAME]]]`, `leave`.
 **lab-guest** (any node): `add`, `del`, `list`.
 
@@ -439,6 +477,9 @@ create a third: which address does it get, and why?
 | `ssh NAME` says unknown node | the node has not joined; `ssh` falls back to the VM's own IP on its PC |
 | `! join refused: ERROR bad-token` | `hubctl token` vs `state/token` on this PC; the hub takes SMBIOS `lab.token` at boot |
 | node NotReady | `lab-agent status` on it, `agent.log`; hub reachable? |
+| `cloud start`: API does not answer | `./cluster.sh cloud logs api`; port `CLOUD_PORT` in use? |
+| cloud: jobs stay `queued` | worker not running (`cloud status`), Redis down (`cloud logs redis`) |
+| cloud: `502 cluster: hub not reachable` | the hub VM is down or `state/id_lab` does not match the images (`./cluster.sh list`) |
 | `vm add` fails on a spoke | `hubctl exec NODE lab-guest list`, `guest.log`, that node's `commands/all.log`; `hubctl images` |
 | `no Ready node has N MB RAM free` | `hubctl nodes` (free/total); smaller `--mem`, more spokes, or bigger `SPOKE_MEM` |
 | guest has no address | `hubctl vm info NAME` (type `none` gets no seed); inside: `cloud-init status --long`; the seed in that node's `files.log` |
