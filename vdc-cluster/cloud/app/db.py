@@ -31,6 +31,7 @@ class Tenant(SQLModel, table=True):
     max_vcpus: int
     max_mem_mb: int
     max_disk_gb: int
+    max_tunnels: int = 2
     created: datetime = Field(default_factory=now)
 
 
@@ -67,12 +68,27 @@ class Vm(SQLModel, table=True):
 
 
 class Job(SQLModel, table=True):
+    """the job queue: the API adds rows, the worker (python -m app.worker) runs them in order"""
     id: str = Field(primary_key=True)
     kind: str                                            # vm.create, image.add, node.add, ...
     target: str = ""
     tenant_id: Optional[int] = Field(default=None, index=True)
     username: str
-    created: datetime = Field(default_factory=now)
+    created: datetime = Field(default_factory=now, index=True)
+    func: str = ""                                       # a name from tasks.TASKS
+    kwargs: str = "{}"                                   # JSON
+    state: str = Field(default="queued", index=True)     # queued | started | finished | failed
+    started: Optional[datetime] = None
+    ended: Optional[datetime] = None
+    result: str = ""                                     # JSON
+    error: str = ""
+
+
+class WorkerBeat(SQLModel, table=True):
+    """the worker's heartbeat, so /provider/health can tell whether jobs will run"""
+    id: int = Field(default=1, primary_key=True)
+    ts: datetime = Field(default_factory=now)
+    pid: int = 0
 
 
 class AuditEvent(SQLModel, table=True):
@@ -101,6 +117,37 @@ class UsageSample(SQLModel, table=True):
     cost: float = 0.0
 
 
+class ConsoleSession(SQLModel, table=True):
+    """a web console (ttyd on the hub) opened through the API; its id is the URL secret"""
+    id: str = Field(primary_key=True)                    # 32 hex: /console/<id>/
+    vm: str
+    tenant_id: int = Field(index=True)
+    username: str
+    port: int
+    cred: str                                            # ttyd basic auth, added by the proxy
+    created: datetime = Field(default_factory=now)
+    expires: datetime
+    used: bool = False
+    closed: bool = False
+
+
+class Tunnel(SQLModel, table=True):
+    """a Cloudflare quick tunnel (cloudflared on this PC) to a guest's port, or to a web console"""
+    id: str = Field(primary_key=True)                    # 12 hex
+    vm: str
+    tenant_id: int = Field(index=True)
+    username: str
+    protocol: str                                        # http | https | ssh | tcp | console
+    port: int = 0
+    origin: str                                          # what cloudflared forwards to
+    url: str = ""                                        # https://<random>.trycloudflare.com
+    pid: int = 0
+    console_id: str = ""                                 # for protocol console
+    created: datetime = Field(default_factory=now)
+    expires: datetime
+    closed: bool = False
+
+
 DEFAULT_FLAVORS = [
     Flavor(name="tiny", vcpus=1, mem_mb=256, disk_gb=2, price_per_hour=0.005),
     Flavor(name="small", vcpus=1, mem_mb=512, disk_gb=5, price_per_hour=0.01),
@@ -108,8 +155,32 @@ DEFAULT_FLAVORS = [
 ]
 
 
+def _add_missing_columns():
+    """databases from an earlier version: add columns that tables have gained since"""
+    from sqlalchemy import inspect, text
+    insp = inspect(engine)
+    with engine.begin() as conn:
+        for table in SQLModel.metadata.sorted_tables:
+            if not insp.has_table(table.name):
+                continue
+            have = {c["name"] for c in insp.get_columns(table.name)}
+            for col in table.columns:
+                if col.name in have:
+                    continue
+                default = col.default.arg if col.default is not None and not callable(col.default.arg) else None
+                ddl = col.type.compile(dialect=engine.dialect)
+                lit = "" if default is None else (f" DEFAULT {int(default)}" if isinstance(default, bool) else
+                                                  f" DEFAULT {default}" if isinstance(default, (int, float)) else
+                                                  " DEFAULT '" + str(default).replace("'", "''") + "'")
+                conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{col.name}" {ddl}{lit}'))
+                if table.name == "job" and col.name == "state":
+                    # jobs of the Redis era: their outcome was kept in Redis, not here
+                    conn.execute(text("UPDATE job SET state = 'unknown'"))
+
+
 def init_db():
     SQLModel.metadata.create_all(engine)
+    _add_missing_columns()
     with Session(engine) as s:
         if not s.exec(select(Flavor)).first():           # seed flavors once
             s.add_all([Flavor(**f.model_dump()) for f in DEFAULT_FLAVORS])

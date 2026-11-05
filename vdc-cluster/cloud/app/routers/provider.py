@@ -8,17 +8,21 @@ from sqlmodel import Session, select
 
 from .. import config, metering, tasks
 from ..auth import Caller, hash_password, require_role
-from ..db import Flavor, Job, Tenant, User, Vm, get_session
+from ..db import Flavor, Job, Tenant, User, Vm, WorkerBeat, get_session, now, utc
 from ..infra import cluster as hub_cluster, images as hub_images, labhub, nodes as hub_nodes
 from ..schemas import (Accepted, FlavorModel, ImageIn, ImageOut, JobOut, NodeOut, ProviderUserIn, Quota,
                        SpokeAdd, TenantIn, TenantOut, TenantUpdate, UsageReport, UserOut, VmOut)
-from ..services import (audit, enqueue, hub_call, job_view, pick_network, queue, vm_views)
+from ..services import (audit, enqueue, hub_call, job_view, pick_network, vm_views)
 from .tenant import tenant_out
+from .. import access
+from ..schemas import ConsoleIn, ConsoleOut, KeyIn, KeyOut, TunnelOut
+from ..db import Tunnel
 
 CUST = "Business support"
 PROV = "Provisioning & configuration"
 MON = "Monitoring & inventory"
 PORT = "Portability & interoperability"
+ACC = "Access & connectivity"
 
 provider = require_role("provider")
 router = APIRouter(prefix="/provider", dependencies=[Depends(provider)])
@@ -34,7 +38,8 @@ def tenant_or_404(s, name) -> Tenant:
 # ---------------------------------------------------------------- customers and contracts
 @router.get("/tenants", response_model=list[TenantOut], tags=[CUST], summary="All tenants")
 def tenants(s: Session = Depends(get_session)):
-    return [tenant_out(s, t) for t in s.exec(select(Tenant).order_by(Tenant.vni))]
+    hubmap = access.hub_tenants()
+    return [tenant_out(s, t, hubmap) for t in s.exec(select(Tenant).order_by(Tenant.vni))]
 
 
 @router.post("/tenants", response_model=TenantOut, status_code=201, tags=[CUST],
@@ -55,8 +60,11 @@ def onboard(body: TenantIn, c: Caller = Depends(provider), s: Session = Depends(
     s.add(User(username=body.admin_username, password_hash=hash_password(body.admin_password),
                role="consumer", tenant_id=t.id, tenant_admin=True))
     s.commit()
-    audit(s, c, "tenant.create", body.name, detail=f"VNI {vni}, subnet {subnet}, admin {body.admin_username}",
-          tenant=body.name)
+    if access.internet_of(access.hub_tenants().get(body.name)) != body.internet:
+        access.set_internet(t, body.internet)
+    access.refresh_edge_routes()
+    audit(s, c, "tenant.create", body.name, detail=f"VNI {vni}, subnet {subnet}, admin {body.admin_username}, "
+          f"internet {'on' if body.internet else 'off'}", tenant=body.name)
     return tenant_out(s, t)
 
 
@@ -118,8 +126,10 @@ def update_tenant(name: str, body: TenantUpdate, c: Caller = Depends(provider), 
     t = tenant_or_404(s, name)
     if body.display_name is not None:
         t.display_name = body.display_name
+    if body.internet is not None:
+        access.set_internet(t, body.internet)
     s.add(t); s.commit()
-    audit(s, c, "tenant.update", name, tenant=name)
+    audit(s, c, "tenant.update", name, detail=body.model_dump_json(exclude_none=True), tenant=name)
     return tenant_out(s, t)
 
 
@@ -144,6 +154,7 @@ def delete_tenant(name: str, c: Caller = Depends(provider), s: Session = Depends
     for u in s.exec(select(User).where(User.tenant_id == t.id)):
         s.delete(u)
     s.delete(t); s.commit()
+    access.refresh_edge_routes()
     audit(s, c, "tenant.delete", name, tenant=name)
     return Response(status_code=204)
 
@@ -272,7 +283,7 @@ def inventory(s: Session = Depends(get_session)):
                 vms=[v.model_dump() for v in vm_views(s, recs, with_node=True)])
 
 
-@router.get("/health", tags=[MON], summary="Is the hub reachable, how many nodes are Ready, is the queue up")
+@router.get("/health", tags=[MON], summary="Is the hub reachable, how many nodes are Ready, is the job worker running")
 def health(s: Session = Depends(get_session)):
     out = dict(hub="ok", nodes_ready=0, nodes_total=0, queue="ok")
     try:
@@ -280,10 +291,17 @@ def health(s: Session = Depends(get_session)):
         out["nodes_total"], out["nodes_ready"] = len(ns), sum(1 for n in ns if n["status"] == "Ready")
     except labhub.LabError as e:
         out["hub"] = f"unreachable: {e}"
-    try:
-        queue().connection.ping()
-    except Exception as e:                       # redis down or misconfigured
-        out["queue"] = f"unreachable: {e}"
+    if config.QUEUE_BACKEND == "redis":
+        try:
+            from ..services import redis_conn
+            redis_conn().ping()
+        except Exception as e:                   # private Redis not running
+            out["queue"] = f"Redis not reachable: {e.__class__.__name__} (./cluster.sh cloud status)"
+    beat = s.get(WorkerBeat, 1)
+    if out["queue"] == "ok" and (beat is None or (now() - utc(beat.ts)).total_seconds() > 30):
+        out["queue"] = "worker not running: jobs wait (./cluster.sh cloud status)"
+    out["queue_backend"] = config.QUEUE_BACKEND
+    out["jobs_waiting"] = len(s.exec(select(Job).where(Job.state == "queued")).all())
     return out
 
 
@@ -325,3 +343,51 @@ def job(job_id: str, s: Session = Depends(get_session)):
 @router.get("/usage", response_model=UsageReport, tags=[CUST], summary="Accounting: metered usage and cost")
 def usage(since: Optional[datetime] = None, tenant: Optional[str] = None, s: Session = Depends(get_session)):
     return metering.report(s, since=since, tenant=tenant)
+
+
+# ---------------------------------------------------------------- access & connectivity
+@router.get("/tenants/{name}/access", tags=[ACC], summary="A tenant's gateway, internet, jump host and guests")
+def tenant_access(name: str, s: Session = Depends(get_session)):
+    return access.access_of(s, tenant_or_404(s, name))
+
+
+@router.get("/tenants/{name}/keys", response_model=list[KeyOut], tags=[ACC], summary="A tenant's SSH keys")
+def tenant_keys(name: str, s: Session = Depends(get_session)):
+    return access.list_keys(tenant_or_404(s, name))
+
+
+@router.post("/tenants/{name}/keys", response_model=KeyOut, status_code=201, tags=[ACC],
+             summary="Add an SSH key to a tenant")
+def tenant_add_key(name: str, body: KeyIn, c: Caller = Depends(provider), s: Session = Depends(get_session)):
+    return access.add_key(s, c, tenant_or_404(s, name), body.key)
+
+
+@router.delete("/tenants/{name}/keys/{key_id}", status_code=204, tags=[ACC], summary="Remove a tenant's SSH key")
+def tenant_delete_key(name: str, key_id: str, c: Caller = Depends(provider), s: Session = Depends(get_session)):
+    access.delete_key(s, c, tenant_or_404(s, name), key_id)
+    return Response(status_code=204)
+
+
+@router.post("/vms/{name}/console", response_model=ConsoleOut, status_code=201, tags=[ACC],
+             summary="Web console of any VM")
+def any_console(name: str, body: ConsoleIn | None = None, c: Caller = Depends(provider),
+                s: Session = Depends(get_session)):
+    v = s.get(Vm, name)
+    if v is None:
+        raise HTTPException(404, f"no VM {name}")
+    return access.open_console(s, c, v, public=bool(body and body.public))
+
+
+@router.get("/tunnels", response_model=list[TunnelOut], tags=[ACC], summary="Every open Cloudflare tunnel")
+def all_tunnels(s: Session = Depends(get_session)):
+    access.expire_tunnels(s)
+    return [access.tunnel_out(s, t) for t in s.exec(select(Tunnel).where(Tunnel.closed == False))]  # noqa: E712
+
+
+@router.delete("/tunnels/{tid}", status_code=204, tags=[ACC], summary="Close any tunnel")
+def kill_tunnel(tid: str, c: Caller = Depends(provider), s: Session = Depends(get_session)):
+    t = s.get(Tunnel, tid)
+    if t is None or t.closed:
+        raise HTTPException(404, f"no open tunnel {tid}")
+    access.close_tunnel(s, c, t)
+    return Response(status_code=204)

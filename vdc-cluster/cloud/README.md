@@ -27,11 +27,11 @@ app/main.py ── routers/  auth  tenant  provider  audit  carrier
 app/services.py   quotas · address pool · audit log · jobs · merged VM view
         │                     │                            │
         ▼                     ▼                            ▼
-SQLite (app/db.py)      Redis + rq worker            app/infra/
+SQLite (app/db.py)      Redis + RQ → worker          app/infra/
 users, tenants↔VNI,     app/tasks.py:                  labhub.hub()     ssh hub hubctl ...
 quotas, flavors, VMs'   create/delete VM,              labhub.hub_read  /var/lib/lab registries
-owner+flavor, jobs,     add image, add spokes          cluster()        sudo cluster.sh ...
-audit, usage samples
+owner+flavor, the job   add image, add spokes          cluster()        sudo cluster.sh ...
+queue, audit, usage     (app/worker.py)
 ```
 
 The cluster stays the source of truth for infrastructure: it picks addresses and nodes, builds
@@ -77,8 +77,20 @@ they may use, what it costs, and what happened.
   `POST /provider/import` adopts it: tenants get the default quota and no users (add an admin
   with `POST /provider/users`), and VMs get the flavor of their size or `custom`, with `hubctl`
   as their owner.
+- **Web consoles use the URL as the secret.** `POST .../console` returns
+  `/console/<32 hex>/`; whoever opens it gets the console, without logging in to the API, so
+  hand it only to the person who asked. It works for one browser session and expires after
+  `WEBCONSOLE_MINUTES`. ttyd on the hub only accepts connections from the main PC, with a
+  per-session password that only the API knows.
+- **Requests through a Cloudflare tunnel only reach `/console/`.** The API recognises them by
+  Cloudflare's headers (`Cf-Ray`, `Cf-Connecting-Ip`) and their trycloudflare.com host, and
+  answers anything else with 404, so a public console doesn't publish `/docs` or the logins.
+- **Tunnels count against `max_tunnels`** in the tenant's quota (default 2), including public
+  consoles. They close on expiry, on `DELETE`, when the API stops, or when their `cloudflared`
+  dies.
+- **Onboarding takes `"internet": false`** for tenants that start without internet access.
 - **Errors:** `409` = the cluster refused (the message is hubctl's own), `502` = the hub couldn't
-  be reached, `503` = the job queue is down.
+  be reached.
 
 ## Endpoints
 
@@ -107,6 +119,17 @@ they may use, what it costs, and what happened.
 | `GET /provider/hosts` · `/inventory` · `/health` | Monitoring & inventory | physical layer, inventory, health |
 | `GET /provider/vms` · `DELETE /{name}` | Provisioning | VMs of all tenants with their node |
 | `GET /provider/jobs` · `/{id}` | Provisioning | all jobs |
+| `GET /tenant/access` | Access | my gateway, internet, jump host, an `ssh -J` command per guest, a `~/.ssh/config` |
+| `GET /tenant/keys` · `POST` · `DELETE /{id}` | Access | my SSH keys: jump host login, put into new guests |
+| `POST /tenant/vms/{name}/console` | Access | web console (ttyd) of my VM: open the returned URL; `{"public": true}` adds a `public_url` through a tunnel |
+| `GET /tenant/consoles` · `DELETE /{id}` | Access | my open web consoles |
+| `PATCH /provider/tenants/{name}` `{"internet": false}` | Business support | switch a tenant's internet off or on |
+| `GET /provider/tenants/{name}/access` · `/keys` | Access | the same for any tenant |
+| `POST /tenant/vms/{name}/tunnels` `{"protocol": "http", "port": 80}` | Access | publish a port of my VM on the internet (Cloudflare quick tunnel) |
+| `GET /tenant/tunnels` · `DELETE /{id}` | Access | my open tunnels |
+| `GET /provider/tunnels` · `DELETE /{id}` | Access | every open tunnel |
+| `POST /provider/vms/{name}/console` | Access | web console of any VM |
+| `GET /console/{id}/` | (browser) | the console page and its WebSocket, passed through to ttyd on the hub |
 | `GET /audit/events` | Auditor | API audit log (filter by tenant, user, action, result, since) |
 | `GET /audit/reports/{tenant}` | Auditor | contract, usage, VMs, activity, refusals, cost |
 | `GET /audit/metering` | Auditor | usage of every tenant |
@@ -116,30 +139,45 @@ they may use, what it costs, and what happened.
 ## Running it (from the kit folder, main PC)
 
 ```sh
-sudo ./cluster.sh cloud install      # venv in state/cloud/venv, Redis, JWT secret, provider password
+sudo ./cluster.sh cloud install      # Python environment, Redis, cloudflared, JWT secret, provider password
 sudo ./cluster.sh cloud start        # api + worker + meter; prints http://<LABPC_IP>:36100/docs
 sudo ./cluster.sh cloud status
 sudo ./cluster.sh cloud admin        # the provider login (admin / generated password)
-sudo ./cluster.sh cloud logs worker  # api | worker | meter | redis   (all in logs/cloud/)
+sudo ./cluster.sh cloud logs worker  # redis | api | worker | meter   (all in logs/cloud/)
 sudo ./cluster.sh cloud enable       # optional: systemd units, survive reboots
 sudo ./cluster.sh cloud stop
 ```
 
-The API uses three processes:
+The API uses four processes:
+- **redis:** a private Redis for the job queue, on a Unix socket in `state/cloud/` (no TCP port).
 - **api:** uvicorn on `CLOUD_PORT`.
-- **worker:** `rq worker`, which runs the jobs. One is enough, because hubctl locks every change.
-- **meter:** samples running VMs every `CLOUD_METER_MINUTES`.
+- **worker:** `python -m app.worker`, an RQ worker that runs the queued jobs one at a time.
+  Each job's state (queued, started, finished, failed) is also kept in the API's database,
+  so `GET .../jobs` works the same whichever queue is used. With `CLOUD_QUEUE=sqlite` the
+  worker reads its jobs straight from the database and no Redis runs at all.
+- **meter:** samples running VMs every `CLOUD_METER_MINUTES`, and closes expired tunnels and
+  consoles.
+
+Cloudflare tunnels are further processes, one `cloudflared` each, which the API starts and
+stops itself.
 
 They run as root, like `cluster.sh`, because they read `state/id_lab` and call `cluster.sh`.
-`install` uses the system's Redis if there is one; otherwise `start` runs its own instance with
-its data in `state/cloud/`.
+
+Everything stays inside the kit folder. `install` creates a private Python environment in
+`state/cloud/venv` (with the pip cache and bytecode next to it) and installs no system packages;
+it only needs `python3`, version 3.10 or newer. For Redis it uses a `redis-server` program on
+PATH if there is one, or builds one into `state/cloud/redis`; it downloads `cloudflared` into
+`state/cloud/bin`. If that Python has no `venv` module, it
+bootstraps pip inside the environment instead of asking for `python3-venv`. The only step
+outside the folder is the optional `cloud enable`, which writes systemd unit files
+(`cloud disable` removes them).
 
 | Where | What |
 |---|---|
 | `cloud/` | the code (part of the kit; goes into git) |
-| `state/cloud/` | `venv/`, `cloud.db` (SQLite), `jwt-secret`, `admin-password`, `cloud.env`, pid files (git-ignored) |
-| `logs/cloud/` | `api.log`, `worker.log`, `meter.log`, `redis.log` |
-| `cluster.conf` | `CLOUD_PORT`, `CLOUD_BIND`, `CLOUD_ADMIN_USER`, `CLOUD_REDIS_URL`, `CLOUD_VNI_MIN/MAX`, `CLOUD_SUBNET_TEMPLATE`, `CLOUD_METER_MINUTES` |
+| `state/cloud/` | `venv/`, `pip-cache/`, `pycache/`, `cloud.db` (SQLite), `redis.conf`, `redis.sock`, `redis.rdb`, `bin/cloudflared`, `tunnels/` (one log per tunnel), `jwt-secret`, `admin-password`, `cloud.env`, pid files (git-ignored) |
+| `logs/cloud/` | `redis.log`, `api.log`, `worker.log`, `meter.log` |
+| `cluster.conf` | `CLOUD_PORT`, `CLOUD_BIND`, `CLOUD_ADMIN_USER`, `CLOUD_VNI_MIN/MAX`, `CLOUD_SUBNET_TEMPLATE`, `CLOUD_METER_MINUTES` |
 
 Back up `state/cloud/cloud.db` together with the rest of `state/`: it holds the users, tenants'
 quotas, VM ownership, the audit log and the usage records.
@@ -197,11 +235,12 @@ Or open `http://10.20.1.1:36100/docs`, press **Authorize**, log in as any user, 
 
 ## Tests
 
-`tests/` runs the whole story against a stand-in hub (`tests/fakehub.py`) and an in-memory Redis.
+`tests/` runs the whole story against a stand-in hub (`tests/fakehub.py`), with its own
+temporary database.
 That story is onboarding, isolation, quotas, a failing job, metering and the auditor's view:
 
 ```sh
-sudo ./cluster.sh cloud install --dev && sudo ./cluster.sh cloud test     # 21 passed
+sudo ./cluster.sh cloud install --dev && sudo ./cluster.sh cloud test     # 43 passed
 ```
 
 ## What is not here yet (needs small changes to the kit)
@@ -209,8 +248,7 @@ sudo ./cluster.sh cloud install --dev && sudo ./cluster.sh cloud test     # 21 p
 | Feature | Kit change |
 |---|---|
 | VM start / stop / resize | `hubctl vm start|stop NAME` (virsh on the guest's node) |
-| SSH keys in guests | `--ssh-key` for `hubctl vm add` → cloud-init user-data |
-| Browser console | WebSocket endpoint running `hubctl vm console` → xterm.js |
 | VM export / snapshot | qcow2 export on the node, served by the hub |
 | Broker (several clusters) | a `cluster` field and one `labhub` target per cluster |
 | Web portals | separate front ends on this API; `/docs` serves meanwhile |
+| Floating IPs, security groups | the next step after the tenant router, jump host and tunnels |

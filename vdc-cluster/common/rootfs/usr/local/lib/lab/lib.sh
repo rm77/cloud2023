@@ -43,6 +43,12 @@ is_cidr() {   # a.b.c.d/len, network address aligned, len 16..29
   _n=$(ip2int "${1%/*}"); [ $(( _n & ((1 << (32 - _l)) - 1) )) -eq 0 ]
 }
 is_num() { printf '%s' "$1" | grep -Eq '^[0-9]{1,6}$'; }
+gw_of() { int2ip $(( $(ip2int "${1%/*}") + 1 )); }    # CIDR -> its .1 (the tenant gateway)
+cidr_overlap() {   # CIDR CIDR -> true if the two ranges share an address
+  _a=$(ip2int "${1%/*}") _b=$(ip2int "${2%/*}")
+  _ae=$((_a + (1 << (32 - ${1#*/})) - 1)) _be=$((_b + (1 << (32 - ${2#*/})) - 1))
+  [ "$_a" -le "$_be" ] && [ "$_b" -le "$_ae" ]
+}
 
 randhex() { head -c "${1:-16}" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 

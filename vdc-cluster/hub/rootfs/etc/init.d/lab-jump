@@ -1,0 +1,18 @@
+#!/sbin/openrc-run
+# shellcheck shell=sh disable=SC2034
+# vdc-cluster jump host: a second sshd for the tenants' t-<tenant> accounts (JUMP_PORT)
+description="vdc-cluster SSH jump host for tenants"
+command=/usr/sbin/sshd
+command_args="-f /etc/ssh/sshd_jump_config"
+pidfile=/run/sshd.jump.pid
+
+depend() {
+  need net
+  after sshd lab-hub
+}
+
+start_pre() {
+  # the host key is created by the main sshd on first boot
+  [ -s /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -q -t ed25519 -N '' -f /etc/ssh/ssh_host_ed25519_key
+  /usr/sbin/sshd -t -f /etc/ssh/sshd_jump_config
+}

@@ -3,7 +3,10 @@
 #
 #   eth0 (uplink, DHCP)  -- NAT --  eth1 (underlay, static HUB_IP)
 #   logs: /var/log/lab/{hub,api,dnsmasq,guest}.log
-#   dnsmasq    DNS for the underlay (NAME.lab); DHCP too if IP_MODE=dhcp
+#   dnsmasq    DNS for the underlay (NAME.lab) and the tenant gateways; DHCP too if IP_MODE=dhcp
+#   lab-jump   SSH jump host for tenants (JUMP_PORT), keys only, forwarding only
+#   nftables   tenant router: NAT out, tenants apart (written by hubctl apply)
+#   ttyd       web consoles of guests, proxied by the cloud API
 #   lab-hub    br-t<VNI> per tenant + g<VNI>-<node> Geneve tunnel per spoke
 #   lab-api    busybox httpd: /cgi-bin/join|state|leave, /images/cirros.qcow2
 #   libvirtd   the hub is also a compute node (HUB_SCHEDULABLE)
@@ -15,14 +18,9 @@ set -eu
 KIT=${KIT:-$(cd "$(dirname "$0")/.." && pwd)}
 . "$KIT/common/setup-base.sh"
 
-prefix_mask() {   # 16 -> 255.255.0.0
-  m=$(( (0xffffffff << (32 - $1)) & 0xffffffff ))
-  echo "$((m >> 24 & 255)).$((m >> 16 & 255)).$((m >> 8 & 255)).$((m & 255))"
-}
-
 base_install
 say "hub packages"
-apk add --no-cache dnsmasq busybox-extras
+apk add --no-cache dnsmasq busybox-extras ttyd
 role_files hub
 chmod 755 /usr/local/lib/lab/cgi.sh /var/lib/lab/www/cgi-bin/*
 chmod 755 /var/lib/lab /var/lib/lab/www /var/lib/lab/www/cgi-bin
@@ -50,48 +48,8 @@ NET
 wrote /etc/network/interfaces "hub: uplink (DHCP) + underlay (static)"
 echo hub >/etc/hostname
 
-cat >/etc/dnsmasq.conf <<DNS
-# vdc-cluster hub: DNS for the underlay only (members resolve as NAME.lab)
-interface=$HUB_UNDERLAY_IF
-bind-interfaces
-domain=lab
-local=/lab/
-expand-hosts
-addn-hosts=/var/lib/lab/hosts
-log-facility=/var/log/lab/dnsmasq.log
-DNS
-if [ "$IP_MODE" = dhcp ]; then
-  say "hub: DHCP server on the underlay ($DHCP_START - $DHCP_END)"
-  cat >>/etc/dnsmasq.conf <<DHCP
-# IP_MODE=dhcp: leases for spokes, pinned per member on join
-dhcp-authoritative
-dhcp-range=$DHCP_START,$DHCP_END,$(prefix_mask "$UNDERLAY_PREFIX"),12h
-dhcp-option=option:router,$HUB_IP
-dhcp-option=option:dns-server,$HUB_IP
-dhcp-option=26,$UNDERLAY_MTU
-dhcp-hostsfile=/var/lib/lab/dhcp-hosts
-log-dhcp
-DHCP
-else
-  say "hub: static addressing, no DHCP server on the underlay"
-fi
-wrote /etc/dnsmasq.conf "hub DNS${IP_MODE:+ ($IP_MODE addressing)}"
-install -d -m 755 /var/log/lab
-touch /var/log/lab/dnsmasq.log /var/log/lab/api.log
-chown dnsmasq /var/log/lab/dnsmasq.log 2>/dev/null || chmod 666 /var/log/lab/dnsmasq.log
-
-cat >/etc/nftables.nft <<NFT
-#!/usr/sbin/nft -f
-# vdc-cluster hub: underlay -> internet via the uplink (no filtering: it's a lab)
-flush ruleset
-table ip lab_nat {
-  chain postrouting {
-    type nat hook postrouting priority srcnat; policy accept;
-    ip saddr $UNDERLAY_NET/$UNDERLAY_PREFIX oifname "$HUB_UPLINK_IF" masquerade
-  }
-}
-NFT
-wrote /etc/nftables.nft "NAT: underlay -> internet via the hub's uplink"
+say "hub: DNS (underlay + tenant gateways), SSH jump host on port ${JUMP_PORT:-45222}, firewall"
+/usr/local/sbin/lab-hub-config
 
 say "CirrOS base image, served to every node"
 install -d -m 755 /var/lib/lab/www/images

@@ -1,0 +1,113 @@
+#!/bin/sh
+# lab-hub-config - the hub's service configuration, from /etc/lab/cluster.env:
+# DNS (dnsmasq), the tenants' SSH jump host (lab-jump), the firewall's boot file.
+# The image build runs it (hub/setup.sh); 'cluster.sh update' runs it on a running hub.
+#
+#   lab-hub-config             write the files, register the services
+#   lab-hub-config --running   also add missing packages and restart the services
+set -eu
+. /usr/local/lib/lab/lib.sh
+RUNNING=0
+[ "${1:-}" = --running ] && RUNNING=1
+
+prefix_mask() {   # 16 -> 255.255.0.0
+  m=$(( (0xffffffff << (32 - $1)) & 0xffffffff ))
+  echo "$((m >> 24 & 255)).$((m >> 16 & 255)).$((m >> 8 & 255)).$((m & 255))"
+}
+
+if [ "$RUNNING" = 1 ]; then
+  if ! apk info -e ttyd >/dev/null 2>&1; then step "package ttyd (web consoles)"; apk add --no-cache ttyd; fi
+fi
+
+# ---- DNS: members as NAME.lab on the underlay; also each tenant's gateway (br-t*),
+#      bound as those bridges appear (bind-dynamic)
+step "dnsmasq: underlay and tenant gateways"
+cat >/etc/dnsmasq.conf <<DNS
+# vdc-cluster hub: DNS for the underlay (members resolve as NAME.lab) and for the
+# tenants (their gateway .1 on br-t<VNI> answers too)
+interface=$HUB_UNDERLAY_IF
+interface=br-t*
+bind-dynamic
+domain=lab
+local=/lab/
+expand-hosts
+addn-hosts=/var/lib/lab/hosts
+log-facility=/var/log/lab/dnsmasq.log
+DNS
+if [ "$IP_MODE" = dhcp ]; then
+  cat >>/etc/dnsmasq.conf <<DHCP
+# IP_MODE=dhcp: leases for spokes on the underlay only, pinned per member on join
+dhcp-authoritative
+dhcp-range=$DHCP_START,$DHCP_END,$(prefix_mask "$UNDERLAY_PREFIX"),12h
+dhcp-option=option:router,$HUB_IP
+dhcp-option=option:dns-server,$HUB_IP
+dhcp-option=26,$UNDERLAY_MTU
+dhcp-hostsfile=/var/lib/lab/dhcp-hosts
+log-dhcp
+DHCP
+fi
+trace_file /etc/dnsmasq.conf "hub DNS: underlay + tenant gateways ($IP_MODE addressing)"
+install -d -m 755 /var/log/lab
+touch /var/log/lab/dnsmasq.log /var/log/lab/console.log
+chown dnsmasq /var/log/lab/dnsmasq.log 2>/dev/null || chmod 666 /var/log/lab/dnsmasq.log
+
+# ---- jump host: a second sshd, only for the tenants' t-<tenant> accounts (hubctl creates
+#      them), forwarding only; the firewall limits each account to its tenant's subnet
+step "jump host: sshd on $HUB_IP:${JUMP_PORT:-45222} for group lab-tenants"
+grep -q '^lab-tenants:' /etc/group || addgroup -S lab-tenants
+install -d -m 755 /var/lib/lab /var/lib/lab/keys
+cat >/etc/ssh/sshd_jump_config <<JUMP
+# vdc-cluster jump host: tenants reach their own guests with
+#   ssh -J t-<tenant>@<lab PC>:${JUMP_PORT:-45222} <user>@<guest address>
+Port ${JUMP_PORT:-45222}
+ListenAddress $HUB_IP
+HostKey /etc/ssh/ssh_host_ed25519_key
+PidFile /run/sshd.jump.pid
+AllowGroups lab-tenants
+PermitRootLogin no
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AuthorizedKeysFile /var/lib/lab/keys/%u
+StrictModes yes
+AllowTcpForwarding local
+AllowStreamLocalForwarding no
+GatewayPorts no
+X11Forwarding no
+AllowAgentForwarding no
+PermitTunnel no
+PermitTTY no
+PermitUserRC no
+ForceCommand /bin/false
+ClientAliveInterval 60
+LogLevel VERBOSE
+JUMP
+trace_file /etc/ssh/sshd_jump_config "jump host for tenants: keys only, forwarding only"
+
+# ---- firewall: hubctl apply writes /etc/nftables.nft from the registries; until it has
+#      run once, the boot file only NATs the underlay out (as before)
+if ! grep -q 'written by hubctl' /etc/nftables.nft 2>/dev/null; then
+  cat >/etc/nftables.nft <<NFT
+#!/usr/sbin/nft -f
+# vdc-cluster hub: underlay -> internet; replaced by 'hubctl apply' with the full firewall
+table ip lab_nat {}
+delete table ip lab_nat
+table ip lab_nat {
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr $UNDERLAY_NET/$UNDERLAY_PREFIX oifname "$HUB_UPLINK_IF" masquerade
+  }
+}
+NFT
+  trace_file /etc/nftables.nft "NAT: underlay -> internet via the hub's uplink"
+fi
+
+rc-update add nftables boot >/dev/null 2>&1 || true
+rc-update add lab-jump default >/dev/null 2>&1 || true
+
+if [ "$RUNNING" = 1 ]; then
+  rc-service dnsmasq restart
+  rc-service lab-jump restart 2>/dev/null || rc-service lab-jump start
+  /usr/local/sbin/hubctl apply
+fi

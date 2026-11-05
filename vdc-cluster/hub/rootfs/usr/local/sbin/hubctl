@@ -7,10 +7,20 @@
 #   hubctl token [rotate]                join token for new spokes
 #
 #   hubctl tenant add NAME VNI [SUBNET]  bridge br-t<VNI> here + g<VNI>-<node> per spoke;
-#                                        SUBNET for the IPAM (VNI 1-254: default 192.168.<VNI>.0/24)
+#                                        SUBNET for the IPAM (VNI 1-254: default 192.168.<VNI>.0/24);
+#                                        .1 of it becomes the tenant's gateway on this hub
+#   hubctl tenant set NAME internet on|off   guests reach the internet (NAT) or not
 #   hubctl tenant del NAME
 #   hubctl tenants
 #   hubctl ips [TENANT]                  address allocations
+#
+#   hubctl key add TENANT 'ssh-ed25519 AAAA... comment'   tenant SSH key: jump host + new guests
+#   hubctl key del TENANT FINGERPRINT
+#   hubctl keys TENANT
+#
+#   hubctl console start GUEST SID CRED  web console (ttyd) of a guest -> prints its port
+#   hubctl console stop SID
+#   hubctl consoles
 #
 #   hubctl image add NAME URL|--file PATH [--type cloud-init|cirros|none] [--mem MB]
 #                    [--disk SIZE] [--user LOGIN]       register a tenant base image
@@ -34,7 +44,10 @@ umask 077
 . /usr/local/lib/lab/lib.sh
 S=$LAB_STATE
 NODES=$S/nodes            # NAME IP MAC SECRET
-TENANTS=$S/tenants        # NAME VNI SUBNET
+TENANTS=$S/tenants        # NAME VNI SUBNET INTERNET(on|off)
+KEYDIR=$S/keys            # t-<tenant>: the tenant's SSH keys (jump host + new guests)
+CONSOLES=/run/lab/console # SID: "PORT PID GUEST" of a running web console
+FIREWALL=/etc/nftables.nft
 VMS=$S/vms                # GUEST TENANT NODE IMAGE IP MEM MAC CPUS
 IMAGES=$S/images          # NAME TYPE MEM DISK USER SHA256 SIZE_MB
 IMGDIR=$S/www/images      # served to the nodes as http://hub:API_PORT/images/NAME.qcow2
@@ -107,9 +120,15 @@ regen_dns() {   # dnsmasq resolves NAME.lab (and pins leases in dhcp mode)
 cmd_apply() {
   # (POSIX sh has no locals: _-prefixed names so callers' variables survive)
   _want=" "
-  while read -r _t _v _; do
+  while read -r _t _v _s _; do
     [ -n "$_t" ] || continue
     ensure_bridge "br-t$_v"
+    _s=${_s:-192.168.$_v.0/24}
+    _gw=$(gw_of "$_s")
+    if ! ip -4 addr show dev "br-t$_v" | grep -q " $_gw/"; then
+      step "gateway $_gw of tenant $_t on br-t$_v"
+      ip addr replace "$_gw/${_s#*/}" dev "br-t$_v"
+    fi
     _want="$_want br-t$_v "
     while read -r _n _ip _; do
       [ -n "$_n" ] || continue
@@ -124,6 +143,110 @@ cmd_apply() {
         case $_want in *" $_dev "*) ;; *) step "$_dev is no longer wanted"; ip link del "$_dev" 2>/dev/null || true ;; esac ;;
     esac
   done
+  jump_sync
+  fw_apply
+}
+
+tenant_internet() { awk -v t="$1" '$1==t {print ($4 != "" ? $4 : "on"); exit}' "$TENANTS"; }
+
+# one jump account per tenant: t-<tenant>, group lab-tenants, no shell, no password,
+# keys in $KEYDIR/t-<tenant>; sshd.jump lets it forward connections, the firewall
+# (fw_apply) limits those to the tenant's own subnet
+jump_sync() {
+  grep -q '^lab-tenants:' /etc/group || addgroup -S lab-tenants
+  install -d -m 755 "$KEYDIR"
+  while read -r _t _; do
+    [ -n "$_t" ] || continue
+    _u=t-$_t
+    if ! id "$_u" >/dev/null 2>&1; then
+      step "jump account $_u of tenant $_t"
+      adduser -S -D -H -h /var/empty -s /sbin/nologin -G lab-tenants "$_u"
+      echo "$_u:*" | chpasswd -e          # unlocked, no password: keys only
+    fi
+    [ -e "$KEYDIR/$_u" ] || : >"$KEYDIR/$_u"
+    chmod 644 "$KEYDIR/$_u"
+  done <"$TENANTS"
+  for _u in $(awk -F: '$1 ~ /^t-/ {print $1}' /etc/passwd); do
+    if ! has "$TENANTS" "${_u#t-}"; then
+      step "jump account $_u: tenant is gone"
+      deluser "$_u" 2>/dev/null || true
+      rm -f "$KEYDIR/$_u"
+    fi
+  done
+}
+
+# the hub firewall, written from the registries: tenant router (NAT out, tenants apart,
+# tenants away from the underlay and the hub's services), jump host, web console ports
+fw_rules() {
+  _nets="" _out=""
+  while read -r _t _v _s _i; do
+    [ -n "$_t" ] || continue
+    _s=${_s:-192.168.$_v.0/24}
+    _nets="$_nets${_nets:+, }$_s"
+    [ "${_i:-on}" = off ] || _out="$_out${_out:+, }$_s"
+  done <"$TENANTS"
+  cat <<NFT
+#!/usr/sbin/nft -f
+# vdc-cluster hub firewall - written by hubctl from $TENANTS (do not edit: hubctl apply)
+table ip lab_nat {}
+delete table ip lab_nat
+table ip lab_nat {
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr $UNDERLAY_NET/$UNDERLAY_PREFIX oifname "$HUB_UPLINK_IF" masquerade
+${_out:+    ip saddr { $_out \} oifname \"$HUB_UPLINK_IF\" masquerade}
+  }
+}
+table inet lab_fw {}
+delete table inet lab_fw
+table inet lab_fw {
+  set tenants { type ipv4_addr; flags interval;${_nets:+ elements = { $_nets \};} }
+  set internet { type ipv4_addr; flags interval;${_out:+ elements = { $_out \};} }
+
+  chain input {
+    type filter hook input priority filter; policy accept;
+    iifname "br-t*" ct state established,related accept
+    iifname "br-t*" icmp type echo-request accept
+    iifname "br-t*" meta l4proto { tcp, udp } th dport 53 accept
+    iifname "br-t*" drop
+    tcp dport ${WEBCONSOLE_PORTS:-45300-45399} ip saddr != $LABPC_IP drop
+  }
+
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+    ct state established,related accept
+    ip saddr @tenants ip daddr @tenants drop
+    ip saddr @internet oifname "$HUB_UPLINK_IF" accept
+    ip saddr @tenants drop
+    ip daddr @tenants ip saddr $LABPC_IP accept
+    ip daddr @tenants drop
+  }
+
+  chain output {
+    type filter hook output priority filter; policy accept;
+NFT
+  while read -r _t _v _s _; do
+    [ -n "$_t" ] || continue
+    _uid=$(id -u "t-$_t" 2>/dev/null) || continue
+    echo "    meta skuid $_uid ct state new ip daddr ${_s:-192.168.$_v.0/24} accept"
+    echo "    meta skuid $_uid ct state new meta l4proto { tcp, udp } th dport 53 accept"
+    echo "    meta skuid $_uid ct state new reject"
+  done <"$TENANTS"
+  echo "  }"
+  echo "}"
+}
+
+fw_apply() {
+  _new=$(mktemp)
+  fw_rules >"$_new"
+  if cmp -s "$_new" "$FIREWALL" && nft list table inet lab_fw >/dev/null 2>&1; then rm -f "$_new"; return 0; fi
+  step "hub firewall: $(wc -l <"$TENANTS" | tr -d ' ') tenant(s)"
+  if nft -f "$_new"; then
+    mv "$_new" "$FIREWALL"; chmod 644 "$FIREWALL"
+    trace_file "$FIREWALL" "hub firewall (tenant router, jump host, web consoles)"
+  else
+    echo "warning: firewall rules rejected by nft, kept the old ones ($_new)" >&2
+  fi
 }
 
 poke() {   # ask every spoke to sync now (async, best effort; the poll catches up anyway)
@@ -331,12 +454,27 @@ cmd_tenant() {
       lock
       if has "$TENANTS" "$2"; then die "tenant $2 exists"; fi
       if awk -v v="$3" '$2==v {f=1} END {exit !f}' "$TENANTS"; then die "VNI $3 already used"; fi
-      echo "$2 $3 $sn" >>"$TENANTS"
+      # the hub routes for every tenant: subnets must not overlap each other or the underlay
+      if cidr_overlap "$sn" "$UNDERLAY_NET/$UNDERLAY_PREFIX"; then die "subnet $sn overlaps the underlay $UNDERLAY_NET/$UNDERLAY_PREFIX"; fi
+      while read -r _ot _ov _os _; do
+        [ -n "$_ot" ] || continue
+        if cidr_overlap "$sn" "${_os:-192.168.$_ov.0/24}"; then die "subnet $sn overlaps tenant $_ot (${_os:-192.168.$_ov.0/24})"; fi
+      done <"$TENANTS"
+      echo "$2 $3 $sn ${TENANT_INTERNET:-on}" >>"$TENANTS"
       cmd_apply
       sync_tenant_nets "$TENANTS"
       poke
       logf "tenant add: $2 $3 $sn"
-      echo "tenant $2: VNI $3, subnet $sn, hub bridge br-t$3, $(wc -l <"$NODES" | tr -d ' ') spoke tunnel(s)" ;;
+      echo "tenant $2: VNI $3, subnet $sn, gateway $(gw_of "$sn"), internet ${TENANT_INTERNET:-on}, jump account t-$2, $(wc -l <"$NODES" | tr -d ' ') spoke tunnel(s)" ;;
+    set)
+      [ $# -eq 4 ] && [ "$3" = internet ] || die "usage: hubctl tenant set NAME internet on|off"
+      has "$TENANTS" "$2" || die "no tenant $2"
+      case $4 in on|off) ;; *) die "internet: on or off" ;; esac
+      lock
+      awk -v t="$2" -v i="$4" '$1==t {$4=i} {print}' "$TENANTS" >"$TENANTS.tmp" && mv "$TENANTS.tmp" "$TENANTS"
+      fw_apply
+      logf "tenant set: $2 internet $4"
+      echo "tenant $2: internet $4" ;;
     del)
       [ $# -eq 2 ] || die "usage: hubctl tenant del NAME"
       has "$TENANTS" "$2" || die "no tenant $2"
@@ -349,13 +487,14 @@ cmd_tenant() {
       logf "tenant del: $2"
       echo "tenant $2 removed" ;;
     list|"")
-      printf '%-16s %-6s %-18s %-7s %s\n' TENANT VNI SUBNET GUESTS HUB-TUNNELS
+      printf '%-16s %-6s %-18s %-15s %-8s %-6s %s\n' TENANT VNI SUBNET GATEWAY INTERNET GUESTS HUB-TUNNELS
       while read -r t v _; do
         [ -n "$t" ] || continue
         g=$(awk -v t="$t" '$2==t' "$VMS" | wc -l | tr -d ' ')
         tun=""
         for d in /sys/class/net/g"$v"-*; do [ -e "$d" ] && tun="$tun${d##*/} "; done
-        printf '%-16s %-6s %-18s %-7s %s\n' "$t" "$v" "$(tenant_subnet "$t")" "$g" "${tun:--}"
+        printf '%-16s %-6s %-18s %-15s %-8s %-6s %s\n' "$t" "$v" "$(tenant_subnet "$t")" "$(gw_of "$(tenant_subnet "$t")")" \
+          "$(tenant_internet "$t")" "$g" "${tun:--}"
       done <"$TENANTS" ;;
     *) usage; exit 1 ;;
   esac
@@ -519,7 +658,9 @@ cmd_vm_add() {   # TENANT NAME [NODE] [--image I] [--node N] [--ip A] [--mem MB]
   flock -u 9
   logf "vm add: $g tenant=$t node=$node image=$img ip=$ip mac=$mac mem=$mem"
   echo "placing $g (tenant $t, image $img) on $node: $ip/${sn#*/}, $mac, ${mem} MB, $disk"
-  args="add $t $g --image $img --type $itype --sha $isha --ip $ip/${sn#*/} --mac $mac --mem $mem --cpus $cpus --disk $disk"
+  gw=$(gw_of "$sn")
+  args="add $t $g --image $img --type $itype --sha $isha --ip $ip/${sn#*/} --mac $mac --mem $mem --cpus $cpus --disk $disk --gw $gw --dns $gw"
+  if [ -s "$KEYDIR/t-$t" ]; then args="$args --keys $(base64 <"$KEYDIR/t-$t" | tr -d '\n')"; fi
   if [ "$node" = hub ]; then
     # shellcheck disable=SC2086
     lab-guest $args && ok=1 || ok=0
@@ -530,6 +671,117 @@ cmd_vm_add() {   # TENANT NAME [NODE] [--image I] [--node N] [--ip A] [--mem MB]
   case $itype in
     none) echo "note: image type 'none' gets no seed - $ip is reserved but must be configured inside the guest" ;;
     *) echo "login on the console: $iuser / ${GUEST_PASSWORD:-vdclab}   (hubctl vm console $g)" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- tenant SSH keys
+key_fp() { ssh-keygen -lf "$1" 2>/dev/null | awk '{print $2}'; }   # FILE (one key) -> SHA256:...
+fp_norm() { printf '%s' "${1#SHA256:}" | tr -- '-_' '+/'; }          # accept URL-safe form too
+
+cmd_key() {
+  case ${1:-} in
+    add)
+      [ $# -ge 3 ] || die "usage: hubctl key add TENANT 'ssh-ed25519 AAAA... comment'"
+      t=$2; shift 2; k=$*
+      has "$TENANTS" "$t" || die "no tenant $t"
+      case $k in
+        ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-nistp*\ *|sk-ssh-ed25519@openssh.com\ *|sk-ecdsa-sha2-nistp256@openssh.com\ *) ;;
+        *) die "not an SSH public key (expected ssh-ed25519 AAAA..., ssh-rsa ..., ecdsa-sha2-...)" ;;
+      esac
+      case $k in *"
+"*) die "one key per call" ;; esac
+      tmp=$(mktemp); printf '%s\n' "$k" >"$tmp"
+      fp=$(key_fp "$tmp"); rm -f "$tmp"
+      [ -n "$fp" ] || die "ssh-keygen does not accept this key"
+      jump_sync
+      f=$KEYDIR/t-$t
+      lock
+      while IFS= read -r l; do
+        [ -n "$l" ] || continue
+        tmp=$(mktemp); printf '%s\n' "$l" >"$tmp"
+        if [ "$(key_fp "$tmp")" = "$fp" ]; then rm -f "$tmp"; die "key $fp is already registered for $t"; fi
+        rm -f "$tmp"
+      done <"$f"
+      printf '%s\n' "$k" >>"$f"; chmod 644 "$f"
+      logf "key add: $t $fp"
+      echo "$fp" ;;
+    del)
+      [ $# -eq 3 ] || die "usage: hubctl key del TENANT FINGERPRINT"
+      has "$TENANTS" "$2" || die "no tenant $2"
+      f=$KEYDIR/t-$2 want=$(fp_norm "$3") found=0
+      lock
+      : >"$f.tmp"
+      while IFS= read -r l; do
+        [ -n "$l" ] || continue
+        tmp=$(mktemp); printf '%s\n' "$l" >"$tmp"
+        if [ "$(fp_norm "$(key_fp "$tmp")")" = "$want" ]; then found=1; else printf '%s\n' "$l" >>"$f.tmp"; fi
+        rm -f "$tmp"
+      done <"$f"
+      [ "$found" = 1 ] || { rm -f "$f.tmp"; die "no key $3 for tenant $2"; }
+      mv "$f.tmp" "$f"; chmod 644 "$f"
+      logf "key del: $2 $3"
+      echo "removed" ;;
+    list)
+      [ $# -eq 2 ] || die "usage: hubctl keys TENANT"
+      has "$TENANTS" "$2" || die "no tenant $2"
+      printf '%-50s %-8s %s\n' FINGERPRINT TYPE COMMENT
+      [ -s "$KEYDIR/t-$2" ] || return 0
+      # ssh-keygen -l: "BITS FINGERPRINT COMMENT... (TYPE)"
+      ssh-keygen -lf "$KEYDIR/t-$2" | awk '{t=$NF; gsub(/[()]/, "", t); c=""; for (i = 3; i < NF; i++) c = c (c ? " " : "") $i; printf "%-50s %-8s %s\n", $2, t, (c ? c : "-")}' ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------- web consoles (ttyd)
+# ttyd serves one guest's serial console as a web terminal, on the underlay only, under
+# /console/<SID>/ with basic-auth CRED. The cloud API proxies it to the browser; the hub
+# firewall lets only the lab PC reach these ports. One browser session, then it exits.
+cmd_console() {
+  case ${1:-} in
+    start)
+      [ $# -eq 4 ] || die "usage: hubctl console start GUEST SID CRED"
+      has "$VMS" "$2" || die "no guest $2"
+      printf '%s' "$3" | grep -Eq '^[a-f0-9]{16,64}$' || die "SID: 16-64 hex characters"
+      printf '%s' "$4" | grep -Eq '^[A-Za-z0-9_-]{12,64}$' || die "CRED: 12-64 of A-Z a-z 0-9 _ -"
+      command -v ttyd >/dev/null || die "ttyd is not installed on the hub (apk add ttyd, or cluster.sh update)"
+      install -d -m 700 "$CONSOLES"
+      lock
+      lo=${WEBCONSOLE_PORTS%-*} hi=${WEBCONSOLE_PORTS#*-}
+      listening=$(netstat -ltn 2>/dev/null | awk 'NR > 2 {n = split($4, a, ":"); print a[n]}')
+      port="" p=$lo
+      while [ "$p" -le "$hi" ]; do
+        if ! printf '%s\n' "$listening" | grep -qx "$p" && ! cat "$CONSOLES"/* 2>/dev/null | grep -q "^$p "; then port=$p; break; fi
+        p=$((p + 1))
+      done
+      [ -n "$port" ] || die "no free web console port in $WEBCONSOLE_PORTS"
+      step "web console of $2 on port $port"
+      setsid timeout -s TERM $(( ${WEBCONSOLE_MINUTES:-60} * 60 )) \
+        ttyd -i "$HUB_UNDERLAY_IF" -p "$port" -b "/console/$3" -c "lab:$4" -W -o \
+             -t "titleFixed=$2 - vdc-cluster" /usr/local/sbin/hubctl vm console "$2" \
+        >>"$LAB_LOG/console.log" 2>&1 </dev/null &
+      echo "$port $! $2" >"$CONSOLES/$3"
+      flock -u 9
+      i=0
+      while [ $i -lt 10 ] && ! netstat -ltn 2>/dev/null | grep -q ":$port "; do sleep 1; i=$((i + 1)); done
+      netstat -ltn 2>/dev/null | grep -q ":$port " || { rm -f "$CONSOLES/$3"; die "ttyd did not start (see $LAB_LOG/console.log)"; }
+      logf "console start: $2 sid=$3 port=$port"
+      echo "$port" ;;
+    stop)
+      [ $# -eq 2 ] || die "usage: hubctl console stop SID"
+      [ -f "$CONSOLES/$2" ] || die "no console $2"
+      read -r _ pid _ <"$CONSOLES/$2"
+      kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+      rm -f "$CONSOLES/$2"
+      logf "console stop: $2"
+      echo "stopped" ;;
+    list|"")
+      printf '%-34s %-6s %s\n' SID PORT GUEST
+      for f in "$CONSOLES"/*; do
+        [ -f "$f" ] || continue
+        read -r port pid g <"$f"
+        if kill -0 "$pid" 2>/dev/null; then printf '%-34s %-6s %s\n' "${f##*/}" "$port" "$g"; else rm -f "$f"; fi
+      done ;;
+    *) usage; exit 1 ;;
   esac
 }
 
@@ -555,7 +807,9 @@ cmd_vm() {
         echo "image    ${i:-cirros}  ($(field "$IMAGES" "${i:-cirros}" 2))"
         echo "address  ${a:--}/${sn#*/}   MAC ${mac:--}"
         echo "size     ${m:-192} MB RAM, ${c:-1} vCPU"
+        echo "gateway  $(gw_of "$sn")  (DNS too), internet $(tenant_internet "$t")"
         echo "login    $(field "$IMAGES" "${i:-cirros}" 5) / ${GUEST_PASSWORD:-vdclab}   (hubctl vm console $g)"
+        echo "ssh      ssh -J t-$t@<lab PC>:${JUMP_PORT:-45222} $(field "$IMAGES" "${i:-cirros}" 5)@$a"
       done ;;
     console)
       [ $# -eq 2 ] || die "usage: hubctl vm console NAME"
@@ -582,6 +836,10 @@ case ${1:-help} in
   tenant) shift; cmd_tenant "$@" ;;
   tenants) cmd_tenant list ;;
   ips) shift; cmd_ips "$@" ;;
+  key) shift; cmd_key "$@" ;;
+  keys) shift; cmd_key list "$@" ;;
+  console) shift; cmd_console "$@" ;;
+  consoles) cmd_console list ;;
   image) shift; cmd_image "$@" ;;
   images) cmd_image list ;;
   vm) shift; cmd_vm "$@" ;;

@@ -4,6 +4,7 @@
 #
 #   lab-guest add TENANT NAME --image I --type cloud-init|cirros|none --sha SHA256
 #                 --ip A.B.C.D/LEN --mac MAC [--mem MB] [--cpus N] [--disk SIZE]
+#                 [--gw A.B.C.D] [--dns A.B.C.D] [--keys BASE64]   (gateway, DNS, SSH keys)
 #   lab-guest del NAME
 #   lab-guest list                       NAME TENANT STATE
 #
@@ -40,8 +41,11 @@ fetch_base() {   # IMAGE SHA -> path of the cached base
   echo "$base"
 }
 
-write_seed() {   # NAME TYPE IP/LEN MAC SEED_ISO
+write_seed() {   # NAME TYPE IP/LEN MAC SEED_ISO   (+ $gw $dns $keys from cmd_add)
   d=$(mktemp -d)
+  # the tenant's SSH keys (hubctl key add), one per line
+  keyfile=$d/keys
+  if [ -n "$keys" ]; then printf '%s' "$keys" | base64 -d >"$keyfile" 2>/dev/null || : >"$keyfile"; else : >"$keyfile"; fi
   printf 'instance-id: %s-%s\nlocal-hostname: %s\n' "$1" "$(randhex 4)" "$1" >"$d/meta-data"
   case $2 in
     cloud-init)
@@ -55,6 +59,10 @@ chpasswd:
   expire: false
 ssh_pwauth: true
 UD
+      if [ -s "$keyfile" ]; then
+        echo "ssh_authorized_keys:" >>"$d/user-data"
+        while IFS= read -r k; do [ -n "$k" ] && printf '  - "%s"\n' "$k" >>"$d/user-data"; done <"$keyfile"
+      fi
       cat >"$d/network-config" <<NC
 # address allocated by the hub's IPAM (hubctl ips)
 version: 2
@@ -66,6 +74,16 @@ ethernets:
     addresses:
       - $3
 NC
+      if [ -n "$gw" ]; then
+        cat >>"$d/network-config" <<NC
+    routes:
+      - to: default
+        via: $gw
+    nameservers:
+      addresses: [${dns:-$gw}]
+      search: [lab]
+NC
+      fi
       ;;
     cirros)
       cat >"$d/user-data" <<UD
@@ -79,6 +97,20 @@ ip link set "\$dev" up
 echo "cirros:${GUEST_PASSWORD:-vdclab}" | chpasswd 2>/dev/null || true
 hostname $1
 UD
+      if [ -n "$gw" ]; then
+        cat >>"$d/user-data" <<UD
+ip route replace default via $gw dev "\$dev"
+echo "nameserver ${dns:-$gw}" >/etc/resolv.conf
+UD
+      fi
+      if [ -s "$keyfile" ]; then
+        { echo "mkdir -p /home/cirros/.ssh"
+          echo "cat >>/home/cirros/.ssh/authorized_keys <<'KEYS'"
+          cat "$keyfile"
+          echo "KEYS"
+          echo "chown -R cirros /home/cirros/.ssh; chmod 700 /home/cirros/.ssh; chmod 600 /home/cirros/.ssh/authorized_keys"
+        } >>"$d/user-data"
+      fi
       ;;
   esac
   for f in meta-data user-data network-config; do
@@ -93,11 +125,12 @@ UD
 cmd_add() {
   [ $# -ge 2 ] || die "usage: lab-guest add TENANT NAME --image I --type T --sha SHA --ip A/LEN --mac MAC [--mem MB] [--cpus N] [--disk SIZE]"
   t=$1 n=$2; shift 2
-  img="" type="" sha="" ip="" mac="" mem=192 cpus=1 disk=""
+  img="" type="" sha="" ip="" mac="" mem=192 cpus=1 disk="" gw="" dns="" keys=""
   while [ $# -gt 0 ]; do
     case $1 in
       --image) img=$2 ;; --type) type=$2 ;; --sha) sha=$2 ;; --ip) ip=$2 ;; --mac) mac=$2 ;;
       --mem) mem=$2 ;; --cpus) cpus=$2 ;; --disk) disk=$2 ;;
+      --gw) gw=$2 ;; --dns) dns=$2 ;; --keys) keys=$2 ;;
       *) die "lab-guest add: unknown option $1" ;;
     esac
     shift 2
@@ -108,6 +141,9 @@ cmd_add() {
   is_mac "$mac" || die "--mac"
   is_ip4 "${ip%/*}" || die "--ip A.B.C.D/LEN"
   is_num "$mem" && is_num "$cpus" || die "--mem/--cpus"
+  [ -z "$gw" ] || is_ip4 "$gw" || die "--gw A.B.C.D"
+  [ -z "$dns" ] || is_ip4 "$dns" || die "--dns A.B.C.D"
+  [ -z "$keys" ] || printf '%s' "$keys" | grep -Eq '^[A-Za-z0-9+/=]+$' || die "--keys: base64"
   virsh net-info "tenant-$t" >/dev/null 2>&1 || die "network tenant-$t not on $(hostname)"
   if virsh dominfo "$n" >/dev/null 2>&1; then die "guest $n already exists"; fi
 

@@ -17,7 +17,7 @@ KEY = os.environ.get("VDC_KEY", os.path.join(KIT, "state", "id_lab"))
 TIMEOUT = int(os.environ.get("VDC_TIMEOUT", "900"))
 SUDO = os.environ.get("VDC_SUDO", "" if os.geteuid() == 0 else "sudo -n").split()
 
-SSH = ["ssh", "-i", KEY, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+SSH = ["ssh", "-F", "/dev/null", "-i", KEY, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
        "-o", "StrictHostKeyChecking=accept-new",
        "-o", "UserKnownHostsFile=" + os.path.join(KIT, "state", "known_hosts.mgmt"),
        "-o", "LogLevel=ERROR"]
@@ -25,7 +25,7 @@ SSH = ["ssh", "-i", KEY, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
 # registry layouts (hub/rootfs/usr/local/sbin/hubctl)
 REGISTRY = {
     "nodes":   ["name", "ip", "mac", "secret"],
-    "tenants": ["name", "vni", "subnet"],
+    "tenants": ["name", "vni", "subnet", "internet"],
     "vms":     ["name", "tenant", "node", "image", "ip", "mem", "mac", "cpus"],
     "images":  ["name", "type", "mem", "disk", "user", "sha256", "size_mb"],
 }

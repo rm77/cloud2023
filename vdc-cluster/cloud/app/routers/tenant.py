@@ -4,7 +4,7 @@
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlmodel import Session, select
 
 from .. import metering
@@ -16,18 +16,24 @@ from ..schemas import (Accepted, FlavorModel, ImageOut, JobOut, NetworkOut, Tena
 from ..services import (audit, check_quota, enqueue, gateway_of, hub_call, job_view, quota_of,
                         tenant_allocations, usage_of, vm_views)
 from .. import tasks
+from .. import access
+from ..db import ConsoleSession, Tunnel
+from ..schemas import AccessOut, ConsoleIn, ConsoleOut, KeyIn, KeyOut, TunnelIn, TunnelOut
 
 PROV = "Provisioning & configuration"
 BIZ = "Business support"
 PORT = "Portability & interoperability"
+ACC = "Access & connectivity"
 
 router = APIRouter(prefix="/tenant", dependencies=[Depends(require_role("consumer"))])
 consumer = require_role("consumer")
 
 
-def tenant_out(s, t):
+def tenant_out(s, t, hubmap=None):
+    hubmap = hubmap if hubmap is not None else access.hub_tenants()
     return TenantOut(name=t.name, display_name=t.display_name, vni=t.vni, subnet=t.subnet,
-                     gateway=gateway_of(t.subnet), quota=quota_of(t), usage=usage_of(s, t), created=t.created)
+                     gateway=gateway_of(t.subnet), internet=access.internet_of(hubmap.get(t.name)),
+                     jump_user=f"t-{t.name}", quota=quota_of(t), usage=usage_of(s, t), created=t.created)
 
 
 def my_vm(name: str, c: Caller = Depends(consumer), s: Session = Depends(get_session)) -> Vm:
@@ -156,3 +162,79 @@ def jobs(limit: int = 50, c: Caller = Depends(consumer), s: Session = Depends(ge
 @router.get("/jobs/{job_id}", response_model=JobOut, tags=[PROV], summary="One of my jobs")
 def job(j: Job = Depends(my_job), s: Session = Depends(get_session)):
     return job_view(s, j)
+
+
+# ---------------------------------------------------------------- access & connectivity
+@router.get("/access", response_model=AccessOut, tags=[ACC],
+            summary="How to reach my guests: gateway, internet, jump host, ssh commands, ~/.ssh/config")
+def my_access(c: Caller = Depends(consumer), s: Session = Depends(get_session)):
+    return access.access_of(s, c.tenant)
+
+
+@router.get("/keys", response_model=list[KeyOut], tags=[ACC], summary="My tenant's SSH public keys")
+def keys(c: Caller = Depends(consumer)):
+    return access.list_keys(c.tenant)
+
+
+@router.post("/keys", response_model=KeyOut, status_code=201, tags=[ACC],
+             summary="Add an SSH public key: jump host login, and put into guests created from now on")
+def add_key(body: KeyIn, c: Caller = Depends(consumer), s: Session = Depends(get_session)):
+    return access.add_key(s, c, c.tenant, body.key)
+
+
+@router.delete("/keys/{key_id}", status_code=204, tags=[ACC], summary="Remove an SSH key (id from GET /tenant/keys)")
+def delete_key(key_id: str, c: Caller = Depends(consumer), s: Session = Depends(get_session)):
+    access.delete_key(s, c, c.tenant, key_id)
+    return Response(status_code=204)
+
+
+@router.post("/vms/{name}/console", response_model=ConsoleOut, status_code=201, tags=[ACC],
+             summary="Web console of one of my VMs: open the returned url in a browser "
+                     "({\"public\": true}: also a public_url through a Cloudflare tunnel)")
+def open_console(body: ConsoleIn | None = None, v: Vm = Depends(my_vm), c: Caller = Depends(consumer),
+                 s: Session = Depends(get_session)):
+    if v.status != "active":
+        raise HTTPException(409, f"{v.name} is {v.status}")
+    return access.open_console(s, c, v, public=bool(body and body.public))
+
+
+@router.get("/consoles", response_model=list[ConsoleOut], tags=[ACC], summary="My open web consoles")
+def consoles(c: Caller = Depends(consumer), s: Session = Depends(get_session)):
+    access.expire_consoles(s)
+    rows = s.exec(select(ConsoleSession).where(ConsoleSession.tenant_id == c.tenant.id,
+                                               ConsoleSession.closed == False))  # noqa: E712
+    return [ConsoleOut(id=r.id, vm=r.vm, url=f"/console/{r.id}/", public_url=access.console_public_url(s, r.id),
+                       expires=r.expires) for r in rows]
+
+
+@router.delete("/consoles/{sid}", status_code=204, tags=[ACC], summary="Close one of my web consoles")
+def close_console(sid: str, c: Caller = Depends(consumer), s: Session = Depends(get_session)):
+    cs = s.get(ConsoleSession, sid)
+    if cs is None or cs.tenant_id != c.tenant.id:
+        raise HTTPException(404, "no such console in your tenant")
+    access.close_console(s, c, cs)
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------- Cloudflare quick tunnels
+@router.post("/vms/{name}/tunnels", response_model=TunnelOut, status_code=201, tags=[ACC],
+             summary="Publish a port of my VM on the internet: https://<random>.trycloudflare.com")
+def open_tunnel(body: TunnelIn, v: Vm = Depends(my_vm), c: Caller = Depends(consumer),
+                s: Session = Depends(get_session)):
+    return access.open_tunnel(s, c, v, body.protocol, body.port, body.hours)
+
+
+@router.get("/tunnels", response_model=list[TunnelOut], tags=[ACC], summary="My open tunnels")
+def my_tunnels(c: Caller = Depends(consumer), s: Session = Depends(get_session)):
+    access.expire_tunnels(s)
+    rows = s.exec(select(Tunnel).where(Tunnel.tenant_id == c.tenant.id, Tunnel.closed == False))  # noqa: E712
+    return [access.tunnel_out(s, t) for t in rows]
+
+
+@router.delete("/tunnels/{tid}", status_code=204, tags=[ACC], summary="Close one of my tunnels")
+def close_tunnel(tid: str, c: Caller = Depends(consumer), s: Session = Depends(get_session)):
+    t = s.get(Tunnel, tid)
+    if t is None or t.tenant_id != c.tenant.id or t.closed:
+        raise HTTPException(404, "no such tunnel in your tenant")
+    access.close_tunnel(s, c, t)
+    return Response(status_code=204)

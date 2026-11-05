@@ -10,7 +10,7 @@ from sqlmodel import Session
 from .auth import bootstrap_admin
 from .db import engine, init_db
 from .infra.labhub import LabError
-from .routers import audit, auth, carrier, provider, tenant
+from .routers import audit, auth, carrier, console, provider, tenant
 
 log = logging.getLogger("vdc-cloud")
 
@@ -25,6 +25,10 @@ TAGS = [
      "Provisioning/Configuration: rapid provisioning and resource changing (VMs, spokes), jobs."},
     {"name": "Portability & interoperability", "description": "CCRA Cloud Service Management → "
      "Portability/Interoperability: standard cloud images (qcow2, cloud-init NoCloud); this OpenAPI contract."},
+    {"name": "Access & connectivity", "description": "How consumers reach their guests. CCRA Security "
+     "(SSH keys, the jump host) and Cloud Carrier (the path from campus into the lab), plus the "
+     "web console, and Cloudflare quick tunnels that publish a guest's port (or a web console) on "
+     "the internet. The internet switch per tenant is on PATCH /provider/tenants/{name}."},
     {"name": "Monitoring & inventory", "description": "CCRA Provisioning → monitoring and reporting; "
      "Business Support → inventory. Resource pool and physical layer."},
     {"name": "Auditor", "description": "CCRA Cloud Auditor: read-only evidence. API audit log, per-tenant "
@@ -54,12 +58,36 @@ async def lifespan(app):
         msg = bootstrap_admin(s)
         if msg:
             log.warning(msg)
+        from . import access
+        access.expire_tunnels(s)             # tunnels that died while the API was down
     yield
 
 
+class TunnelGuard:
+    """requests that come in through a Cloudflare tunnel may only use /console/ (public web
+    consoles); everything else of the API stays on the lab network"""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            h = {k.decode().lower(): v.decode(errors="replace") for k, v in scope.get("headers", [])}
+            via_cf = "cf-ray" in h or "cf-connecting-ip" in h or h.get("host", "").endswith(".trycloudflare.com")
+            if via_cf and not scope.get("path", "").startswith("/console/"):
+                if scope["type"] == "http":
+                    await send({"type": "http.response.start", "status": 404,
+                                "headers": [(b"content-type", b"text/plain")]})
+                    await send({"type": "http.response.body", "body": b"not found"})
+                else:
+                    await send({"type": "websocket.close", "code": 4404})
+                return
+        await self.app(scope, receive, send)
+
+
 app = FastAPI(title="vdc-cloud", version="1.0", description=DESCRIPTION, openapi_tags=TAGS, lifespan=lifespan)
-for r in (auth.router, tenant.router, provider.router, audit.router, carrier.router):
+for r in (auth.router, tenant.router, provider.router, audit.router, carrier.router, console.router):
     app.include_router(r)
+app.add_middleware(TunnelGuard)
 
 
 @app.exception_handler(LabError)

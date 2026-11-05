@@ -2,27 +2,13 @@
 # audit log, quotas (contract), address pool (onboarding), jobs, the merged VM view.
 from ipaddress import IPv4Network
 
-import redis
 from fastapi import HTTPException
-from rq import Queue
-from rq.exceptions import NoSuchJobError
-from rq.job import Job as RqJob
 from sqlmodel import Session, select
 
 from . import config
 from .db import AuditEvent, Flavor, Job, Tenant, Vm
 from .infra import labhub, vms as hub_vms, tenants as hub_tenants
 from .schemas import Quota, Usage, VmOut
-
-_redis = None
-
-
-def queue() -> Queue:
-    global _redis
-    if _redis is None:
-        _redis = redis.from_url(config.REDIS_URL)
-    return Queue(config.QUEUE, connection=_redis, default_timeout=3600)
-
 
 # ---------------------------------------------------------------- errors from the cluster
 def hub_call(fn, *a, **kw):
@@ -46,12 +32,15 @@ def audit(s: Session, caller, action, target="", result="ok", detail="", tenant=
 
 # ---------------------------------------------------------------- quotas (CCRA contract management)
 def quota_of(t: Tenant) -> Quota:
-    return Quota(max_vms=t.max_vms, max_vcpus=t.max_vcpus, max_mem_mb=t.max_mem_mb, max_disk_gb=t.max_disk_gb)
+    return Quota(max_vms=t.max_vms, max_vcpus=t.max_vcpus, max_mem_mb=t.max_mem_mb, max_disk_gb=t.max_disk_gb,
+                 max_tunnels=t.max_tunnels if t.max_tunnels is not None else 2)
 
 
 def usage_of(s: Session, t: Tenant) -> Usage:
     """counted from the API's VM records, so VMs still being created already count"""
-    u = Usage(vms=0, vcpus=0, mem_mb=0, disk_gb=0)
+    from .db import Tunnel
+    u = Usage(vms=0, vcpus=0, mem_mb=0, disk_gb=0,
+              tunnels=len(s.exec(select(Tunnel).where(Tunnel.tenant_id == t.id, Tunnel.closed == False)).all()))  # noqa: E712
     flavors = {f.name: f for f in s.exec(select(Flavor))}
     hub_rows = None
     for v in s.exec(select(Vm).where(Vm.tenant_id == t.id, Vm.status != "error")):
@@ -110,38 +99,52 @@ def gateway_of(subnet: str) -> str:
 
 
 # ---------------------------------------------------------------- jobs
+# Every job is a row in the Job table (who, what, state, result). The queue that hands it to the
+# worker is Redis + RQ by default (config.QUEUE_BACKEND = "redis"), or the table itself ("sqlite").
+_redis = None
+
+
+def redis_conn():
+    global _redis
+    if _redis is None:
+        import redis
+        _redis = redis.from_url(config.REDIS_URL)
+    return _redis
+
+
+def rq_queue():
+    from rq import Queue
+    return Queue(config.QUEUE, connection=redis_conn(), default_timeout=3600)
+
+
 def enqueue(s: Session, caller, kind, target, func, tenant_id=None, **kwargs) -> Job:
+    import json
     import uuid
+    from . import tasks
+    name = tasks.name_of(func)
     jid = f"{kind.replace('.', '-')}-{uuid.uuid4().hex[:12]}"
-    try:
-        queue().enqueue(func, job_id=jid, kwargs=kwargs, result_ttl=7 * 86400, failure_ttl=7 * 86400)
-    except redis.exceptions.ConnectionError:
-        raise HTTPException(503, "job queue (Redis) is not reachable")
-    j = Job(id=jid, kind=kind, target=target, tenant_id=tenant_id, username=caller.username)
+    j = Job(id=jid, kind=kind, target=str(target), tenant_id=tenant_id, username=caller.username,
+            func=name, kwargs=json.dumps(kwargs, default=str))
     s.add(j); s.commit(); s.refresh(j)
+    if config.QUEUE_BACKEND == "redis":
+        try:
+            rq_queue().enqueue("app.worker.run_job", jid, job_id=jid, result_ttl=86400, failure_ttl=7 * 86400)
+        except Exception as e:                   # Redis down: the job never reaches a worker
+            s.delete(j); s.commit()
+            raise HTTPException(503, f"job queue (Redis) is not reachable: {e.__class__.__name__}")
     return j
 
 
 def job_view(s: Session, j: Job) -> dict:
-    out = dict(id=j.id, kind=j.kind, target=j.target, username=j.username, created=j.created,
-               tenant=(s.get(Tenant, j.tenant_id).name if j.tenant_id and s.get(Tenant, j.tenant_id) else None),
-               state="unknown", ended=None, result=None, error=None)
-    try:
-        r = RqJob.fetch(j.id, connection=queue().connection)
-        st = r.get_status()
-        out["state"] = getattr(st, "value", str(st))
-        out["ended"] = r.ended_at
-        if out["state"] == "finished":
-            res = r.return_value()
-            out["result"] = res if isinstance(res, (dict, list)) else {"value": res}
-        elif out["state"] == "failed":
-            res = r.latest_result() if hasattr(r, "latest_result") else None
-            text = getattr(res, "exc_string", None) or getattr(r, "exc_info", "") or ""
-            lines = text.strip().splitlines()
-            out["error"] = lines[-1] if lines else "failed"
-    except (NoSuchJobError, redis.exceptions.ConnectionError):
-        pass
-    return out
+    import json
+    t = s.get(Tenant, j.tenant_id) if j.tenant_id else None
+    result = None
+    if j.state == "finished" and j.result:
+        r = json.loads(j.result)
+        result = r if isinstance(r, (dict, list)) else {"value": r}
+    return dict(id=j.id, kind=j.kind, target=j.target, username=j.username, created=j.created,
+                tenant=t.name if t else None, state=j.state, ended=j.ended, result=result,
+                error=j.error or None)
 
 
 # ---------------------------------------------------------------- VM view (API record + hub facts)

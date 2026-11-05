@@ -13,6 +13,12 @@ cd "$(dirname "$(readlink -f "$0")")"
 . ../cluster.conf
 LOGD=$(readlink -f ..)/logs/build
 mkdir -p "$LOGD"
+# Packer keeps its plugins, downloads (the Alpine ISO) and settings inside the kit folder,
+# not in ~/.config/packer or ~/.cache (state/packer/ is git-ignored with the rest of state/)
+PK=$(readlink -f ..)/state/packer
+mkdir -p "$PK/plugins" "$PK/cache" "$PK/tmp"
+export PACKER_PLUGIN_PATH=$PK/plugins PACKER_CACHE_DIR=$PK/cache PACKER_CONFIG_DIR=$PK
+export TMPDIR=$PK/tmp CHECKPOINT_DISABLE=1
 
 roles=${1:-all}
 [ "$roles" = all ] && roles="hub spoke"

@@ -65,6 +65,13 @@ if __name__ == "__main__":
             print(f"{now():%F %T} sampled {sample_once()} running VM(s)", flush=True)
         except labhub.LabError as e:
             print(f"{now():%F %T} hub not reachable: {e}", flush=True)
+        try:                                 # close expired tunnels and consoles on time
+            from . import access
+            with Session(engine) as s:
+                access.expire_tunnels(s)
+                access.expire_consoles(s)
+        except Exception as e:               # the hub may be down; next round
+            print(f"{now():%F %T} expiry check: {e}", flush=True)
         if a.once:
             break
         time.sleep(config.METER_INTERVAL * 60)

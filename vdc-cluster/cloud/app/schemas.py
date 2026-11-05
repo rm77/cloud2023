@@ -23,6 +23,7 @@ class Quota(BaseModel):
     max_vcpus: int = Field(ge=0, le=256)
     max_mem_mb: int = Field(ge=0, le=1_048_576)
     max_disk_gb: int = Field(ge=0, le=10_000)
+    max_tunnels: int = Field(2, ge=0, le=20, description="Cloudflare tunnels open at the same time")
 
 
 class Usage(BaseModel):
@@ -30,6 +31,7 @@ class Usage(BaseModel):
     vcpus: int
     mem_mb: int
     disk_gb: int
+    tunnels: int = 0
 
 
 # ---------------------------------------------------------------- tenants
@@ -39,6 +41,7 @@ class TenantIn(BaseModel):
     admin_username: str = Field(pattern=USER, examples=["alice"])
     admin_password: str = Field(min_length=8, max_length=128)
     vni: Optional[int] = Field(None, ge=1, le=65535, description="omit: next free VNI of the pool")
+    internet: bool = Field(True, description="guests reach the internet through the hub (NAT)")
     subnet: Optional[IPv4Network] = Field(None, description="omit: from the pool template, e.g. 10.199.20.0/24")
     quota: Optional[Quota] = None
 
@@ -56,6 +59,8 @@ class TenantOut(BaseModel):
     vni: int
     subnet: str
     gateway: str
+    internet: bool = True
+    jump_user: str = ""
     quota: Quota
     usage: Usage
     created: datetime
@@ -63,6 +68,72 @@ class TenantOut(BaseModel):
 
 class TenantUpdate(BaseModel):
     display_name: Optional[str] = Field(None, max_length=80)
+    internet: Optional[bool] = Field(None, description="switch the tenant's internet access on or off")
+
+
+# ---------------------------------------------------------------- access to guests
+class KeyIn(BaseModel):
+    key: str = Field(max_length=4096, pattern=r"^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|"
+                     r"sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/=]+( [^\r\n]*)?$",
+                     examples=["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... alice@laptop"])
+
+
+class KeyOut(BaseModel):
+    id: str                     # URL-safe fingerprint, for DELETE
+    fingerprint: str            # SHA256:...
+    type: str
+    comment: str
+
+
+class GuestAccess(BaseModel):
+    name: str
+    ip: Optional[str] = None
+    user: str
+    ssh: str
+    console: str
+
+
+class AccessOut(BaseModel):
+    tenant: str
+    subnet: str
+    gateway: str
+    dns: str
+    internet: bool
+    jump_host: str
+    jump_port: int
+    jump_user: str
+    keys: int
+    guests: list[GuestAccess]
+    ssh_config: str
+
+
+class ConsoleIn(BaseModel):
+    public: bool = Field(False, description="also reachable from the internet, through a Cloudflare tunnel")
+
+
+class ConsoleOut(BaseModel):
+    id: str
+    vm: str
+    url: str
+    public_url: Optional[str] = None
+    expires: datetime
+    note: str = "open the url in a browser; it works once, until it expires"
+
+
+class TunnelIn(BaseModel):
+    protocol: Literal["http", "https", "ssh", "tcp"] = "http"
+    port: Optional[int] = Field(None, ge=1, le=65535, description="omit: 80 for http, 443 for https, 22 for ssh")
+    hours: Optional[int] = Field(None, ge=1, le=72, description="omit: the provider's default (8)")
+
+
+class TunnelOut(BaseModel):
+    id: str
+    vm: str
+    protocol: str
+    port: int
+    url: str
+    expires: datetime
+    how: str
 
 
 # ---------------------------------------------------------------- users

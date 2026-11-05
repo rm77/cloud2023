@@ -10,6 +10,10 @@ from app.infra import labhub
 class FakeHub:
     def __init__(self):
         self.tenants = {}              # name -> (vni, subnet)
+        self.internet = {}             # name -> "on" | "off"
+        self.keys = {}                 # tenant -> [(fingerprint, type, comment, key)]
+        self.consoles = {}             # sid -> (port, guest, cred)
+        self.console_port = 0          # set by the test: where the fake ttyd listens
         self.vms = {}                  # name -> dict
         self.images = {"cirros": "cirros cirros 192 1G cirros abc 20"}
         self.nodes = [("hv101", "10.20.1.101", "52:54:00:21:01:01"), ("hv102", "10.20.1.102", "52:54:00:21:01:02")]
@@ -29,7 +33,7 @@ class FakeHub:
 
     def registry(self, name):
         if name == "tenants":
-            return "".join(f"{t} {v} {s}\n" for t, (v, s) in self.tenants.items())
+            return "".join(f"{t} {v} {s} {self.internet.get(t, 'on')}\n" for t, (v, s) in self.tenants.items())
         if name == "vms":
             return "".join(f"{n} {v['tenant']} {v['node']} {v['image']} {v['ip']} {v['mem']} {v['mac']} {v['cpus']}\n"
                            for n, v in self.vms.items())
@@ -48,7 +52,36 @@ class FakeHub:
         if a[:2] == ["tenant", "add"]:
             if a[2] in self.tenants:
                 raise labhub.LabError(f"tenant {a[2]} exists")
-            self.tenants[a[2]] = (int(a[3]), a[4]); return ""
+            self.tenants[a[2]] = (int(a[3]), a[4]); self.internet[a[2]] = "on"; return ""
+        if a[:2] == ["tenant", "set"]:
+            if a[2] not in self.tenants:
+                raise labhub.LabError(f"no tenant {a[2]}")
+            self.internet[a[2]] = a[4]; return f"tenant {a[2]}: internet {a[4]}\n"
+        if a[:2] == ["key", "add"]:
+            import base64, hashlib
+            t, k = a[2], " ".join(a[3:])
+            p = k.split()
+            fp = "SHA256:" + base64.b64encode(hashlib.sha256(p[1].encode()).digest()).decode().rstrip("=")
+            if any(x[0] == fp for x in self.keys.get(t, [])):
+                raise labhub.LabError(f"key {fp} is already registered for {t}")
+            self.keys.setdefault(t, []).append((fp, "ED25519" if p[0] == "ssh-ed25519" else "RSA",
+                                                " ".join(p[2:]) or "-", k))
+            return fp + "\n"
+        if a[:2] == ["key", "del"]:
+            want = a[3].removeprefix("SHA256:").replace("-", "+").replace("_", "/")
+            ks = self.keys.get(a[2], [])
+            left = [x for x in ks if x[0].removeprefix("SHA256:") != want]
+            if len(left) == len(ks):
+                raise labhub.LabError(f"no key {a[3]} for tenant {a[2]}")
+            self.keys[a[2]] = left; return "removed\n"
+        if a[0] == "keys":
+            return "FINGERPRINT TYPE COMMENT\n" + "".join(f"{fp} {ty} {c}\n" for fp, ty, c, _ in self.keys.get(a[1], []))
+        if a[:2] == ["console", "start"]:
+            if a[2] not in self.vms:
+                raise labhub.LabError(f"no guest {a[2]}")
+            self.consoles[a[3]] = (self.console_port, a[2], a[4]); return f"{self.console_port}\n"
+        if a[:2] == ["console", "stop"]:
+            self.consoles.pop(a[2], None); return "stopped\n"
         if a[:2] == ["tenant", "del"]:
             if any(v["tenant"] == a[2] for v in self.vms.values()):
                 raise labhub.LabError(f"tenant {a[2]} has guests")

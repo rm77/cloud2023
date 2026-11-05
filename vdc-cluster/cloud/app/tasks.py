@@ -1,5 +1,5 @@
-# tasks.py - what the RQ worker runs. Each task updates the API's record when the
-# cluster is done, so the portal shows "active" or "error" without anyone polling the hub.
+# tasks.py - what the worker (python -m app.worker) runs. Each task updates the API's record
+# when the cluster is done, so the portal shows "active" or "error" without anyone polling.
 from sqlmodel import Session
 
 from .db import Flavor, Vm, engine
@@ -48,3 +48,12 @@ def add_image(**kw):
 def add_spokes(count):
     return hub_cluster.spoke_add(count=count)
 
+
+
+TASKS = {f.__name__: f for f in (create_vm, delete_vm, add_image, add_spokes)}
+
+
+def name_of(func) -> str:
+    if TASKS.get(func.__name__) is not func:
+        raise ValueError(f"{func} is not a task")
+    return func.__name__

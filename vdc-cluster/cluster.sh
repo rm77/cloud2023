@@ -19,11 +19,13 @@
 #   ./cluster.sh logs tail NAME          follow a VM's serial console log
 #   ./cluster.sh logs collect [NAME|all] copy /var/log/lab etc. from nodes into logs/nodes/
 #   ./cluster.sh logs commands [TOOL]    command journal: per-tool counts, or every TOOL call
+#   ./cluster.sh update [all|hub|spokes] copy changed lab scripts into the running VMs (no rebuild)
+#   ./cluster.sh edge up|down|status     main PC: jump host port from campus to the hub, tenant routes
 #
 # cloud API (cloud/, main PC): NIST CCRA REST API for providers, tenants and auditors
-#   ./cluster.sh cloud install [--dev]   Python venv + Redis + secrets in state/cloud/
+#   ./cluster.sh cloud install [--dev]   own Python environment, Redis, cloudflared, secrets in state/cloud/
 #   ./cluster.sh cloud start|stop|restart|status
-#   ./cluster.sh cloud logs [api|worker|meter|redis]
+#   ./cluster.sh cloud logs [redis|api|worker|meter]
 #   ./cluster.sh cloud admin             the provider login
 #   ./cluster.sh cloud enable|disable    run it under systemd (survives reboots)
 #   ./cluster.sh cloud test              the API's test suite (stand-in hub, no cluster needed)
@@ -40,6 +42,8 @@
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 KIT=$PWD
+# temporary files stay in the kit folder too (state/tmp, git-ignored)
+mkdir -p "$KIT/state/tmp" 2>/dev/null && export TMPDIR=$KIT/state/tmp
 # shellcheck source=cluster.conf
 . ./cluster.conf
 HOST_ID=1 HOST_ROLE=main UPLINK_NIC=""
@@ -54,7 +58,9 @@ NET_BASE=${UNDERLAY_NET%.*.*}          # 10.20
 
 die() { echo "error: $*" >&2; exit 1; }
 need_root() { [ "$(id -u)" = 0 ] || die "run as root: sudo $0 ${ARGS[*]}"; }
-SSH_OPTS=(-i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5)
+# -F /dev/null: ignore ~/.ssh/config (and leave ~/.ssh alone): only the lab key, no known_hosts
+SSH_OPTS=(-F /dev/null -i "$KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+          -o LogLevel=ERROR -o ConnectTimeout=5)
 lab_ssh()   { local ip=$1; shift; ssh "${SSH_OPTS[@]}" "root@$ip" "$@"; }
 lab_ssh_t() { local ip=$1; shift; ssh -t "${SSH_OPTS[@]}" "root@$ip" "$@"; }
 hub() { lab_ssh "$HUB_IP" "$@"; }
@@ -174,6 +180,9 @@ cmd_net_down() {
   if [ -n "$UPLINK_NIC" ] && [ "${UPLINK_NIC%%.*}" != "$UPLINK_NIC" ]; then ip link del "$UPLINK_NIC" 2>/dev/null || true; fi
   ip link del "$UNDERLAY_BR" 2>/dev/null || true
   bridge_fw_remove
+  edge_clear
+  ip route flush proto "$EDGE_RT_PROTO" 2>/dev/null || true
+  edge_forward_restore
   echo "$UNDERLAY_BR removed"
 }
 
@@ -415,12 +424,17 @@ preflight_hub() {
 cmd_up() {
   [ "$HOST_ROLE" = main ] || die "the hub runs on the main PC; this is host $HOST_ID ($HOST_ROLE)"
   cmd_net_up
-  if running hub; then echo "hub already running"; hub hubctl nodes || true; return; fi
-  echo "== hub"
-  [ -f "$VMS/hub.env" ] || vm_create hub hub 52:54:00:20:00:02 "$HUB_MEM" "$HUB_CPUS"
-  vm_start hub
-  watch_boot hub
-  echo; hub hubctl nodes
+  if running hub; then
+    echo "hub already running"; hub hubctl nodes || true
+  else
+    echo "== hub"
+    [ -f "$VMS/hub.env" ] || vm_create hub hub 52:54:00:20:00:02 "$HUB_MEM" "$HUB_CPUS"
+    vm_start hub
+    watch_boot hub
+    echo; hub hubctl nodes
+  fi
+  # routes to the tenant subnets (staff access, Cloudflare tunnels) even without the campus forward
+  if [ "${EDGE:-yes}" = yes ]; then echo; cmd_edge up; else edge_routes; fi
 }
 
 cmd_spoke_add() {
@@ -638,16 +652,169 @@ EOF
   esac
 }
 
+# ---------------------------------------------------------------- edge (main PC)
+# The main PC is the edge between the campus network and the lab. It forwards JUMP_PORT
+# on its campus NIC to the hub's jump host, and routes the tenant subnets via the hub, so
+# staff on this PC reach every guest directly.
+EDGE_RT_PROTO=222          # our routes carry "proto 222" (ip route show proto 222)
+: "${JUMP_PORT:=45222}" "${WEBCONSOLE_PORTS:=45300-45399}"
+edge_if() {
+  if [ -n "${EDGE_IF:-}" ]; then echo "$EDGE_IF"; return; fi
+  ip -4 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}'
+}
+edge_addr() {
+  local i; i=$(edge_if)
+  [ -n "$i" ] && ip -4 -o addr show dev "$i" 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}'
+}
+edge_ipt() {   # TABLE CHAIN RULE...  (added once, on top)
+  local t=$1 c=$2; shift 2
+  iptables -t "$t" -C "$c" "$@" 2>/dev/null || iptables -t "$t" -I "$c" 1 "$@"
+}
+edge_clear() {
+  local t r
+  command -v iptables >/dev/null || return 0
+  for t in nat filter; do
+    iptables -t "$t" -S 2>/dev/null | grep -- '--comment vdc-edge' | sed 's/^-A /-D /' |
+      while read -r r; do eval "iptables -t $t $r" 2>/dev/null || true; done
+  done
+}
+edge_forward_restore() {
+  if [ -f "$ST/edge.ip_forward" ]; then
+    sysctl -qw "net.ipv4.ip_forward=$(cat "$ST/edge.ip_forward")" 2>/dev/null || true
+    rm -f "$ST/edge.ip_forward"
+  fi
+}
+edge_routes() {   # tenant subnets via the hub, from the hub's registry
+  local sn
+  [ "$HOST_ROLE" = main ] && ip link show "$UNDERLAY_BR" >/dev/null 2>&1 || return 0
+  ip route flush proto "$EDGE_RT_PROTO" 2>/dev/null || true
+  for sn in $(hub cat /var/lib/lab/tenants 2>/dev/null | awk 'NF >= 2 {print ($3 != "" ? $3 : "192.168." $2 ".0/24")}'); do
+    ip route replace "$sn" via "$HUB_IP" dev "$UNDERLAY_BR" proto "$EDGE_RT_PROTO" 2>/dev/null || true
+  done
+}
+
+cmd_edge() {
+  [ "$HOST_ROLE" = main ] || die "the edge is the main PC (it runs the hub)"
+  local i a n
+  case ${1:-status} in
+    up)
+      i=$(edge_if || true)
+      if [ -z "$i" ]; then
+        echo "edge: no campus NIC (EDGE_IF is empty and there is no default route)"
+      else
+        command -v iptables >/dev/null || die "the edge needs iptables"
+        step "edge: campus $i:$JUMP_PORT -> jump host $HUB_IP:$JUMP_PORT"
+        # the one kernel setting the edge changes: remembered, and restored by 'edge down'
+        [ -f "$ST/edge.ip_forward" ] || cat /proc/sys/net/ipv4/ip_forward >"$ST/edge.ip_forward"
+        sysctl -qw net.ipv4.ip_forward=1
+        edge_ipt nat PREROUTING -i "$i" -p tcp --dport "$JUMP_PORT" -m comment --comment vdc-edge \
+          -j DNAT --to-destination "$HUB_IP:$JUMP_PORT"
+        # from the hub's view the connection comes from this PC, so its reply returns here
+        edge_ipt nat POSTROUTING -o "$UNDERLAY_BR" -d "$HUB_IP" -p tcp --dport "$JUMP_PORT" \
+          -m comment --comment vdc-edge -j MASQUERADE
+        edge_ipt filter FORWARD -i "$i" -o "$UNDERLAY_BR" -d "$HUB_IP" -p tcp --dport "$JUMP_PORT" \
+          -m comment --comment vdc-edge -j ACCEPT
+        edge_ipt filter FORWARD -i "$UNDERLAY_BR" -o "$i" -s "$HUB_IP" -p tcp --sport "$JUMP_PORT" \
+          -m comment --comment vdc-edge -j ACCEPT
+      fi
+      edge_routes
+      a=$(edge_addr || true)
+      n=$(ip route show proto "$EDGE_RT_PROTO" 2>/dev/null | wc -l)
+      echo "edge up: ssh -J t-<tenant>@${a:-<this PC>}:$JUMP_PORT <user>@<guest>   ($n tenant route(s) via the hub)" ;;
+    routes) edge_routes ;;
+    down)
+      edge_clear
+      ip route flush proto "$EDGE_RT_PROTO" 2>/dev/null || true
+      edge_forward_restore
+      echo "edge down: jump host forward and tenant routes removed" ;;
+    status)
+      i=$(edge_if || true); a=$(edge_addr || true)
+      echo "campus NIC  ${i:-none}${a:+ ($a)}"
+      if iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- '--comment vdc-edge'; then
+        echo "jump host   ${a:-<this PC>}:$JUMP_PORT -> $HUB_IP:$JUMP_PORT"
+      else
+        echo "jump host   not forwarded (./cluster.sh edge up)"
+      fi
+      echo "routes      $(ip route show proto "$EDGE_RT_PROTO" 2>/dev/null | awk '{print $1}' | tr '\n' ' ')" ;;
+    *) die "usage: $0 edge up|down|status|routes" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- update running VMs
+# Copies the lab scripts and cluster.conf into the running hub and spokes and restarts
+# their services, so changes reach a cluster without rebuilding it (and losing the hub's
+# tenants). New packages are added where needed (ttyd on the hub).
+UPDATE_HUB='set -e; K=/tmp/kit-update
+cp -a $K/common/rootfs/. /; cp -a $K/hub/rootfs/. /
+chmod 755 /usr/local/sbin/* /etc/init.d/lab-* /usr/local/lib/lab/cgi.sh /var/lib/lab/www/cgi-bin/*
+install -m 600 $K/cluster.conf /etc/lab/cluster.env
+/usr/local/lib/lab/lab-trace --install /usr/local/lib/lab/trace.d >/dev/null 2>&1 || true
+export LAB_TRACE_CTX="cluster.sh update"
+/usr/local/sbin/lab-hub-config --running
+rc-service lab-api restart >/dev/null
+rm -rf $K'
+UPDATE_SPOKE='set -e; K=/tmp/kit-update
+cp -a $K/common/rootfs/. /; cp -a $K/spoke/rootfs/. /
+chmod 755 /usr/local/sbin/* /etc/init.d/lab-*
+install -m 600 $K/cluster.conf /etc/lab/cluster.env
+/usr/local/lib/lab/lab-trace --install /usr/local/lib/lab/trace.d >/dev/null 2>&1 || true
+rc-service lab-agent restart >/dev/null
+rm -rf $K'
+
+update_node() {   # NAME IP SCRIPT TARBALL
+  if lab_ssh "$2" "rm -rf /tmp/kit-update && mkdir -p /tmp/kit-update && tar -xzf - -C /tmp/kit-update && sh -c '$3'" <"$4" \
+      >>"$LOGS/update.log" 2>&1; then
+    echo "  $1  updated"
+  else
+    echo "  $1  FAILED (logs/update.log)"; return 1
+  fi
+}
+
+cmd_update() {
+  [ "$HOST_ROLE" = main ] || die "update runs on the main PC (it reaches the hub and every spoke)"
+  local what=${1:-all} tarf n ip fails=0
+  case $what in all|hub|spokes) ;; *) die "usage: $0 update [all|hub|spokes]" ;; esac
+  hub_reachable || die "the hub does not answer SSH ($0 list)"
+  tarf=$(mktemp)
+  tar -C "$KIT" -czf "$tarf" cluster.conf common/rootfs hub/rootfs spoke/rootfs
+  echo "== update: lab scripts and cluster.conf into the running VMs (log: logs/update.log)"
+  if [ "$what" != spokes ]; then
+    step "update hub"
+    update_node hub "$HUB_IP" "$UPDATE_HUB" "$tarf" || fails=1
+  fi
+  if [ "$what" != hub ]; then
+    while read -r n ip _; do
+      [ -n "$n" ] || continue
+      step "update spoke $n"
+      update_node "$n" "$ip" "$UPDATE_SPOKE" "$tarf" || fails=1
+    done < <(hub cat /var/lib/lab/nodes)
+  fi
+  rm -f "$tarf"
+  if [ "${EDGE:-yes}" = yes ]; then cmd_edge up; fi
+  if [ -x "$CVENV/bin/python" ] && cloud_pid api >/dev/null; then echo "== cloud API"; cmd_cloud restart; fi
+  [ "$fails" = 0 ] || die "some nodes were not updated"
+  echo "done. Existing guests keep their old network settings until recreated (see README: Access to guests)"
+}
+
 # ---------------------------------------------------------------- cloud API (cloud/)
 # The FastAPI service in cloud/ (NIST CCRA: /tenant /provider /audit /carrier) runs on the main
-# PC next to the kit. Code in cloud/; everything it creates in state/cloud/ and logs/cloud/.
+# PC next to the kit. Code in cloud/; everything it creates in state/cloud/ and logs/cloud/:
+# its own Python environment and pip cache, database, secrets, a private Redis (job queue, on a
+# Unix socket, no TCP port) and cloudflared (tunnels). It installs no system packages and uses
+# no system services.
 CLOUD=$KIT/cloud
 CST=$ST/cloud
 CVENV=$CST/venv
 : "${CLOUD_PORT:=36100}" "${CLOUD_BIND:=0.0.0.0}" "${CLOUD_ADMIN_USER:=admin}"
-: "${CLOUD_REDIS_URL:=redis://127.0.0.1:6379/1}" "${CLOUD_VNI_MIN:=100}" "${CLOUD_VNI_MAX:=254}"
+: "${CLOUD_VNI_MIN:=100}" "${CLOUD_VNI_MAX:=254}"
 : "${CLOUD_SUBNET_TEMPLATE:=10.{vni}.20.0/24}" "${CLOUD_METER_MINUTES:=5}"
-CLOUD_PROCS="api worker meter"
+: "${CLOUD_QUEUE:=redis}" "${CLOUD_TUNNELS:=yes}" "${CLOUD_TUNNEL_HOURS:=8}" "${CLOUD_TUNNELS_PER_TENANT:=2}"
+: "${CLOUD_TUNNEL_PROTOCOL:=auto}"
+if [ "$CLOUD_QUEUE" = redis ]; then CLOUD_PROCS="redis api worker meter"; else CLOUD_PROCS="api worker meter"; fi
+CLOUD_REDIS_SOCK=$CST/redis.sock
+CLOUD_REDIS_URL="unix://$CLOUD_REDIS_SOCK?db=0"
+# Python stays inside the folder: no user site-packages, pip cache and bytecode in state/cloud/
+export PYTHONNOUSERSITE=1 PIP_CACHE_DIR=$CST/pip-cache PYTHONPYCACHEPREFIX=$CST/pycache PIP_DISABLE_PIP_VERSION_CHECK=1
 
 cloud_env_file() {   # state/cloud/cloud.env: the processes' settings (also the systemd EnvironmentFile)
   ( umask 077
@@ -655,8 +822,8 @@ cloud_env_file() {   # state/cloud/cloud.env: the processes' settings (also the 
 VDC_KIT=$KIT
 VDC_HUB=$HUB_IP
 VDC_DB=sqlite:///$CST/cloud.db
-REDIS_URL=$CLOUD_REDIS_URL
-VDC_QUEUE=vdc-cloud
+PYTHONNOUSERSITE=1
+PYTHONPYCACHEPREFIX=$CST/pycache
 VDC_JWT_SECRET=$(cat "$CST/jwt-secret")
 VDC_ADMIN_USER=$CLOUD_ADMIN_USER
 VDC_ADMIN_PASSWORD=$(cat "$CST/admin-password")
@@ -665,40 +832,128 @@ VDC_VNI_MAX=$CLOUD_VNI_MAX
 VDC_SUBNET_TEMPLATE=$CLOUD_SUBNET_TEMPLATE
 VDC_METER_MINUTES=$CLOUD_METER_MINUTES
 VDC_SUDO=
+VDC_EDGE_HOST=$(edge_addr || true)
+VDC_JUMP_PORT=$JUMP_PORT
+VDC_WEBCONSOLE_MINUTES=${WEBCONSOLE_MINUTES:-60}
+VDC_GUEST_PASSWORD=${GUEST_PASSWORD:-vdclab}
+VDC_QUEUE_BACKEND=$CLOUD_QUEUE
+REDIS_URL=$CLOUD_REDIS_URL
+VDC_API_PORT=$CLOUD_PORT
+VDC_TUNNELS=$CLOUD_TUNNELS
+VDC_CLOUDFLARED=$(cloudflared_bin || true)
+VDC_TUNNEL_DIR=$CST/tunnels
+VDC_TUNNEL_HOURS=$CLOUD_TUNNEL_HOURS
+VDC_TUNNELS_PER_TENANT=$CLOUD_TUNNELS_PER_TENANT
+VDC_TUNNEL_PROTOCOL=$CLOUD_TUNNEL_PROTOCOL
 ENV
   )
 }
 
+# ---- the private Redis: a binary on PATH or one built into state/cloud/redis; its own config,
+#      data and socket in state/cloud/ (not the system's Redis service)
+redis_bin() {
+  if [ -x "$CST/redis/bin/redis-server" ]; then echo "$CST/redis/bin/redis-server"; return; fi
+  command -v redis-server
+}
+redis_conf() {
+  cat >"$CST/redis.conf" <<RCONF
+# private Redis of the vdc-cluster cloud API (job queue) - written by cluster.sh
+port 0
+unixsocket $CLOUD_REDIS_SOCK
+unixsocketperm 700
+dir $CST
+dbfilename redis.rdb
+save 60 1
+appendonly no
+daemonize no
+logfile ""
+protected-mode yes
+RCONF
+}
+redis_build() {   # from source, into state/cloud/redis (needs make and a C compiler)
+  local src=$CST/redis-src
+  command -v make >/dev/null && command -v cc >/dev/null ||
+    die "no redis-server on this PC and no make/cc to build one: put a redis-server binary on PATH, or set CLOUD_QUEUE=sqlite"
+  echo "  building Redis from source into state/cloud/redis (once, about a minute)"
+  rm -rf "$src"; mkdir -p "$src" "$CST/redis/bin"
+  "$CVENV/bin/python" -c "import urllib.request, sys; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" \
+      https://download.redis.io/redis-stable.tar.gz "$src/redis.tgz" ||
+    "$CVENV/bin/python" -c "import urllib.request, sys; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" \
+      https://github.com/redis/redis/archive/refs/tags/7.2.6.tar.gz "$src/redis.tgz" ||
+    die "cannot download Redis (no internet?)"
+  tar -xzf "$src/redis.tgz" -C "$src" --strip-components=1
+  make -C "$src/src" -j"$(nproc)" BUILD_TLS=no MALLOC=libc redis-server >"$LOGS/cloud/redis-build.log" 2>&1 ||
+    die "the Redis build failed (logs/cloud/redis-build.log)"
+  cp "$src/src/redis-server" "$CST/redis/bin/"
+  rm -rf "$src"
+}
+redis_up() { "$CVENV/bin/python" -c "import redis, sys; redis.from_url(sys.argv[1]).ping()" "$CLOUD_REDIS_URL" 2>/dev/null; }
+
+# ---- cloudflared, for Cloudflare quick tunnels (https://<random>.trycloudflare.com, no account)
+cloudflared_bin() {
+  if [ -x "$CST/bin/cloudflared" ]; then echo "$CST/bin/cloudflared"; return; fi
+  command -v cloudflared
+}
+cloudflared_get() {
+  local arch b=$CST/bin/cloudflared
+  [ "$CLOUD_TUNNELS" = yes ] || return 0
+  [ -x "$b" ] && return 0
+  case $(uname -m) in
+    x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; armv7l) arch=arm ;;
+    *) echo "  note: no cloudflared build for $(uname -m): tunnels will not work"; return 0 ;;
+  esac
+  echo "  cloudflared into state/cloud/bin (Cloudflare quick tunnels)"
+  mkdir -p "$CST/bin"
+  if "$CVENV/bin/python" -c "import urllib.request, sys; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" \
+       "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$arch" "$b.part" &&
+     chmod 755 "$b.part" && "$b.part" --version >/dev/null 2>&1; then
+    mv "$b.part" "$b"
+  else
+    rm -f "$b.part"
+    echo "  warning: cloudflared download failed: tunnels will not work until 'cloud install' succeeds"
+  fi
+}
+tunnels_stop() {   # the tunnel processes the API started (it marks them closed on its next start)
+  local f
+  for f in "$CST"/tunnels/*.pid; do
+    [ -f "$f" ] || continue
+    kill -TERM -- "-$(cat "$f")" 2>/dev/null || kill "$(cat "$f")" 2>/dev/null || true
+    rm -f "$f"
+  done
+}
+
 cloud_cmd() {   # PROC -> the command line of one process
   case $1 in
+    redis)  echo "$(redis_bin) $CST/redis.conf" ;;
     api)    echo "$CVENV/bin/uvicorn app.main:app --host $CLOUD_BIND --port $CLOUD_PORT" ;;
-    worker) echo "$CVENV/bin/rq worker vdc-cloud --url $CLOUD_REDIS_URL" ;;
+    worker) echo "$CVENV/bin/python -m app.worker" ;;
     meter)  echo "$CVENV/bin/python -m app.metering" ;;
   esac
 }
 
 cloud_pid() { local p=$CST/$1.pid; [ -f "$p" ] && kill -0 "$(cat "$p")" 2>/dev/null && cat "$p"; }
 cloud_systemd() { systemctl is-active --quiet "vdc-cloud-$1" 2>/dev/null; }
-redis_up() { "$CVENV/bin/python" -c "import redis,sys; redis.from_url(sys.argv[1]).ping()" "$CLOUD_REDIS_URL" 2>/dev/null; }
-
-cloud_redis() {   # a reachable Redis: the system's, or one of our own on 127.0.0.1:6379
-  redis_up && { echo "  redis   ok ($CLOUD_REDIS_URL)"; return 0; }
-  systemctl start redis-server 2>/dev/null || systemctl start redis 2>/dev/null || true
-  sleep 1; redis_up && { echo "  redis   system service started"; return 0; }
-  command -v redis-server >/dev/null || die "no Redis: ./cluster.sh cloud install (or set CLOUD_REDIS_URL)"
-  case $CLOUD_REDIS_URL in redis://127.0.0.1:6379/*|redis://localhost:6379/*) ;;
-    *) die "Redis at $CLOUD_REDIS_URL does not answer" ;; esac
-  redis-server --bind 127.0.0.1 --port 6379 --daemonize yes --dir "$CST" \
-    --pidfile "$CST/redis.pid" --logfile "$LOGS/cloud/redis.log" --save 60 1
-  sleep 1; redis_up || die "Redis did not start (logs/cloud/redis.log)"
-  echo "  redis   own instance, data in state/cloud/dump.rdb"
+cloud_venv() {   # a private Python environment in state/cloud/venv (no system packages)
+  [ -x "$CVENV/bin/python" ] && [ -x "$CVENV/bin/pip" ] && return 0
+  command -v python3 >/dev/null || die "python3 is needed (3.10 or newer)"
+  python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' || die "python3 is too old: 3.10 or newer is needed"
+  rm -rf "$CVENV"
+  if python3 -m venv "$CVENV" 2>/dev/null; then return 0; fi
+  # Debian/Ubuntu without python3-venv: a venv without pip, then pip from PyPI into it
+  echo "  (python3 has no ensurepip: bootstrapping pip inside state/cloud/venv)"
+  rm -rf "$CVENV"
+  python3 -m venv --without-pip "$CVENV" || die "python3 -m venv does not work here"
+  "$CVENV/bin/python" -c "import urllib.request; urllib.request.urlretrieve('https://bootstrap.pypa.io/get-pip.py', '$CST/get-pip.py')" ||
+    die "cannot download get-pip.py (no internet?)"
+  "$CVENV/bin/python" "$CST/get-pip.py" -q || die "pip bootstrap failed"
+  rm -f "$CST/get-pip.py"
 }
 
 cloud_unit() {   # PROC -> systemd unit text
   cat <<UNIT
 [Unit]
 Description=vdc-cloud $1 ($KIT)
-After=network-online.target redis-server.service
+After=network-online.target$([ "$1" = redis ] || [ "$CLOUD_QUEUE" != redis ] || echo " vdc-cloud-redis.service")
 
 [Service]
 EnvironmentFile=$CST/cloud.env
@@ -719,21 +974,16 @@ cmd_cloud() {
   local p pid i
   case ${1:-status} in
     install)
-      echo "== cloud install: Python venv in state/cloud/venv, Redis, secrets"
-      if ! python3 -c 'import venv, ensurepip' 2>/dev/null || ! command -v redis-server >/dev/null; then
-        if command -v apt-get >/dev/null; then
-          echo "  apt-get install python3-venv redis-server"
-          DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv redis-server >/dev/null ||
-            die "apt-get install python3-venv redis-server failed"
-        else
-          echo "  note: install Python venv support and redis-server with your package manager"
-        fi
-      fi
-      [ -x "$CVENV/bin/python" ] || python3 -m venv "$CVENV"
+      echo "== cloud install: Python environment, Redis, cloudflared, database and secrets, all in state/cloud/"
+      cloud_venv
       echo "  pip install -r cloud/requirements.txt"
       "$CVENV/bin/pip" install -q --upgrade pip
       "$CVENV/bin/pip" install -q -r "$CLOUD/requirements.txt"
       if [ "${2:-}" = --dev ]; then "$CVENV/bin/pip" install -q -r "$CLOUD/requirements-dev.txt"; fi
+      if [ "$CLOUD_QUEUE" = redis ]; then
+        if redis_bin >/dev/null; then echo "  redis-server: $(redis_bin)"; else redis_build; fi
+      fi
+      cloudflared_get
       [ -s "$CST/jwt-secret" ] || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$CST/jwt-secret"
       [ -s "$CST/admin-password" ] || head -c 12 /dev/urandom | base64 | tr -d '/+=' | cut -c1-14 >"$CST/admin-password"
       chmod 600 "$CST/jwt-secret" "$CST/admin-password"
@@ -744,7 +994,10 @@ cmd_cloud() {
       [ -x "$CVENV/bin/uvicorn" ] || die "not installed: ./cluster.sh cloud install"
       cloud_env_file
       echo "== cloud start"
-      cloud_redis
+      if [ "$CLOUD_QUEUE" = redis ]; then
+        redis_bin >/dev/null || die "no redis-server: ./cluster.sh cloud install (or CLOUD_QUEUE=sqlite)"
+        redis_conf
+      fi
       for p in $CLOUD_PROCS; do
         if cloud_systemd "$p"; then echo "  $p  runs under systemd (vdc-cloud-$p)"; continue; fi
         if pid=$(cloud_pid "$p"); then echo "  $p  already running (pid $pid)"; continue; fi
@@ -753,6 +1006,10 @@ cmd_cloud() {
           exec setsid $(cloud_cmd "$p") >>"$LOGS/cloud/$p.log" 2>&1 </dev/null) &
         echo $! >"$CST/$p.pid"
         echo "  $p  started (pid $!, log logs/cloud/$p.log)"
+        if [ "$p" = redis ]; then
+          for i in $(seq 20); do redis_up && break; sleep 0.5; done
+          redis_up || die "the private Redis did not start (logs/cloud/redis.log)"
+        fi
       done
       for i in $(seq 20); do
         "$CVENV/bin/python" -c "import urllib.request,sys; urllib.request.urlopen(sys.argv[1], timeout=2)" \
@@ -762,13 +1019,11 @@ cmd_cloud() {
       [ "$i" -lt 20 ] || die "the API does not answer on port $CLOUD_PORT: tail logs/cloud/api.log"
       echo "cloud API up: http://$LABPC_IP:$CLOUD_PORT/docs   (provider: $CLOUD_ADMIN_USER / $(cat "$CST/admin-password"))" ;;
     stop)
-      for p in $CLOUD_PROCS; do
+      tunnels_stop
+      for p in $(echo "$CLOUD_PROCS" | tr ' ' '\n' | tac); do    # Redis last
         if pid=$(cloud_pid "$p"); then kill "$pid" 2>/dev/null || true; echo "  $p  stopped"; fi
         rm -f "$CST/$p.pid"
-      done
-      if [ -f "$CST/redis.pid" ] && kill -0 "$(cat "$CST/redis.pid")" 2>/dev/null; then
-        kill "$(cat "$CST/redis.pid")"; echo "  redis   own instance stopped"
-      fi ;;
+      done ;;
     restart) cmd_cloud stop; cmd_cloud start ;;
     status)
       [ -x "$CVENV/bin/python" ] || { echo "cloud API: not installed (./cluster.sh cloud install)"; return 0; }
@@ -777,24 +1032,26 @@ cmd_cloud() {
         elif pid=$(cloud_pid "$p"); then echo "  $p  running (pid $pid)"
         else echo "  $p  stopped"; fi
       done
-      if redis_up; then echo "  redis   ok ($CLOUD_REDIS_URL)"; else echo "  redis   not reachable ($CLOUD_REDIS_URL)"; fi
+      if [ "$CLOUD_QUEUE" = redis ]; then
+        if redis_up; then echo "  queue   Redis on state/cloud/redis.sock"; else echo "  queue   Redis not reachable"; fi
+      else echo "  queue   SQLite (CLOUD_QUEUE=sqlite)"; fi
+      echo "  tunnels $(ls "$CST"/tunnels/*.pid 2>/dev/null | wc -l) running, cloudflared: $(cloudflared_bin || echo missing)"
       echo "  url     http://$LABPC_IP:$CLOUD_PORT/docs" ;;
     logs)
       p=${2:-api}
-      case " $CLOUD_PROCS redis " in *" $p "*) ;; *) die "usage: $0 cloud logs [api|worker|meter|redis]" ;; esac
+      case " $CLOUD_PROCS " in *" $p "*) ;; *) die "usage: $0 cloud logs [$(echo "$CLOUD_PROCS" | tr ' ' '|')]" ;; esac
       exec tail -n 40 -F "$LOGS/cloud/$p.log" ;;
     admin) echo "provider login: $CLOUD_ADMIN_USER / $(cat "$CST/admin-password" 2>/dev/null || echo '(not installed)')" ;;
-    enable)   # the three processes under systemd: they survive reboots
+    enable)   # the processes under systemd: they survive reboots (the one step outside
+              # the folder: unit files in /etc/systemd/system, removed again by 'cloud disable')
       [ -x "$CVENV/bin/uvicorn" ] || die "not installed: ./cluster.sh cloud install"
       command -v systemctl >/dev/null || die "no systemd on this PC: use ./cluster.sh cloud start"
       cloud_env_file
       cmd_cloud stop >/dev/null
       for p in $CLOUD_PROCS; do cloud_unit "$p" >"/etc/systemd/system/vdc-cloud-$p.service"; done
-      systemctl enable --now redis-server 2>/dev/null || systemctl enable --now redis 2>/dev/null ||
-        echo "  warning: no Redis service; the API needs $CLOUD_REDIS_URL"
       systemctl daemon-reload
       for p in $CLOUD_PROCS; do systemctl enable --now "vdc-cloud-$p" >/dev/null 2>&1; done
-      echo "systemd: vdc-cloud-api, vdc-cloud-worker, vdc-cloud-meter enabled and started"
+      echo "systemd: $(for p in $CLOUD_PROCS; do printf 'vdc-cloud-%s ' "$p"; done)enabled and started"
       echo "  note: the hub VM is not started at boot; after a reboot run ./cluster.sh up" ;;
     disable)
       for p in $CLOUD_PROCS; do
@@ -826,6 +1083,8 @@ case ${1:-help} in
   net-down) cmd_net_down ;;
   mtu-check) cmd_mtu_check "${2:-}" ;;
   cloud) shift; cmd_cloud "$@" ;;
+  edge) shift; cmd_edge "$@" ;;
+  update) shift; cmd_update "$@" ;;
   up) cmd_up ;;
   spoke) [ "${2:-}" = add ] || die "usage: $0 spoke add [COUNT]"; cmd_spoke_add "${3:-1}" ;;
   start) [ -n "${2:-}" ] || die "usage: $0 start NAME|all"; cmd_start "$2" ;;
@@ -842,11 +1101,13 @@ case ${1:-help} in
     echo "(Ctrl-] to leave)"; exec socat -,raw,echo=0,escape=0x1d "UNIX-CONNECT:$VMS/$2.serial" ;;
   ssh) need_root; [ -n "${2:-}" ] || die "usage: $0 ssh NAME [CMD]"
     ip=$(node_ip "$2") || die "unknown node $2"; shift 2; lab_ssh_t "$ip" "$@" ;;
-  hubctl) need_root; shift; lab_ssh_t "$HUB_IP" hubctl "$@" ;;
+  hubctl) need_root; shift; rc=0; lab_ssh_t "$HUB_IP" hubctl "$@" || rc=$?
+    case "${1:-} ${2:-}" in "tenant add"|"tenant del") edge_routes ;; esac
+    exit "$rc" ;;
   image) shift; cmd_image "$@" ;;
   images) cmd_image list ;;
   capture) need_root; [ -n "${2:-}" ] || die "usage: $0 capture NAME [FILTER]"
     n=$2; shift 2; exec tcpdump -ni "tap-$n" "$@" ;;
-  help|-h|--help) sed -n '2,39s/^# \{0,1\}//p' "$0" ;;
-  *) sed -n '2,31s/^# \{0,1\}//p' "$0"; exit 1 ;;
+  help|-h|--help) awk 'NR > 1 && !/^#/ {exit} NR > 1 {sub(/^# ?/, ""); print}' "$0" ;;
+  *) awk 'NR > 1 && !/^#/ {exit} NR > 1 {sub(/^# ?/, ""); print}' "$0"; exit 1 ;;
 esac

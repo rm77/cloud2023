@@ -126,6 +126,118 @@ sudo ./cluster.sh rm hv105            # remove it from the hub and delete its di
 `rm` refuses while the spoke still has guests. Delete them first (`hubctl vms` shows where each one runs).
 
 
+## Reaching guests
+
+Every tenant network has a router: the hub. It holds `.1` of each subnet (10.199.20.1 for
+tenant-a), and guests get it as their gateway and DNS server when they are created. Through it
+guests reach the internet, and nothing else: tenants can't reach each other, the spokes or
+the lab PCs. The main lab PC is the exception, so staff can reach every guest from it.
+
+There are four ways to a guest: SSH through the jump host, the web console, a Cloudflare
+tunnel from the internet, and, for staff, directly from the main PC.
+
+### Internet on or off
+
+New tenants have internet (`TENANT_INTERNET=on` in `cluster.conf`). Switch it per tenant, for
+example during an exam:
+
+```bash
+sudo ./cluster.sh hubctl tenant set tenant-a internet off
+sudo ./cluster.sh hubctl tenants          # GATEWAY and INTERNET columns
+```
+
+With internet off, guests still reach their gateway, DNS and each other.
+
+### SSH through the jump host
+
+Each tenant has an account on the hub, `t-<tenant>`, that can only forward connections into
+that tenant's own subnet. The main PC forwards port 45222 (`JUMP_PORT`) from its campus
+network card to it. To use it, a tenant first registers an SSH public key:
+
+```bash
+sudo ./cluster.sh hubctl key add tenant-a "$(cat ~/.ssh/id_ed25519.pub)"
+sudo ./cluster.sh hubctl keys tenant-a
+```
+
+or, as the tenant, with `POST /tenant/keys` in the cloud API. Then, from any computer on the
+campus network:
+
+```bash
+ssh -J t-tenant-a@<main PC's campus address>:45222 ubuntu@10.199.20.10
+```
+
+The same key is put into every guest created afterwards (for the image's default user), so no
+password is needed on either hop. `GET /tenant/access` prints the exact command for each guest
+and a ready-made `~/.ssh/config`. On the main PC itself, use the hub's address instead:
+`ssh -J t-tenant-a@10.20.0.2:45222 ...`.
+
+`sudo ./cluster.sh edge status` shows the forwarded port and the main PC's campus address.
+`cluster.sh up` sets the forward up; `edge down` removes it. Set `EDGE_IF` in `cluster.conf`
+if the campus network card is not the one with the default route, or `EDGE=no` to keep the
+jump host reachable only from the lab PCs.
+
+### Web console
+
+The cloud API opens a guest's serial console in the browser, with ttyd on the hub. As a
+tenant, call `POST /tenant/vms/a1/console` and open the URL it returns
+(`http://<main PC>:36100/console/<id>/`). Log in with the guest's user and password, as on a
+real console. The URL works once and closes after 60 minutes (`WEBCONSOLE_MINUTES`) or when
+the tab closes; ask for a new one to reconnect. The provider can open any guest's console
+with `POST /provider/vms/{name}/console`.
+
+On the hub this is `hubctl console start|stop`, but only the API should call it.
+
+### From the main PC (staff)
+
+The main PC has a route to every tenant subnet via the hub, so `ping 10.199.20.10` or
+`ssh cirros@10.199.20.10` works there directly. The routes follow `hubctl tenant add` and
+`tenant del`, and `cluster.sh edge up` rebuilds them.
+
+### From the internet: Cloudflare tunnels
+
+The cloud API can publish a guest's port on the internet through a Cloudflare quick tunnel. It
+needs no Cloudflare account, no public address and no open port: `cloudflared` on the main PC
+connects out to Cloudflare, which hands back a random address such as
+`https://brave-lion-tiny-cat.trycloudflare.com`.
+
+As a tenant:
+
+```json
+POST /tenant/vms/a1/tunnels
+{"protocol": "http", "port": 80}
+```
+
+The answer has the public `url` and a `how` line explaining how to use it:
+
+| `protocol` | Reaches | From outside |
+|---|---|---|
+| `http` (port 80) | a web server in the guest | open the URL in a browser |
+| `https` (443) | a web server with its own certificate | the same (the guest's certificate isn't checked) |
+| `ssh` (22) | the guest's SSH server | `ssh -o ProxyCommand="cloudflared access ssh --hostname %h" ubuntu@<host>` (the client needs cloudflared too) |
+| `tcp` (any port) | any other TCP service | `cloudflared access tcp --hostname <host> --url localhost:<port>`, then connect to localhost |
+
+A web console can be public too: `POST /tenant/vms/a1/console` with `{"public": true}`
+returns a `public_url` next to the usual one. Through a tunnel only the console pages work;
+the rest of the API is not reachable from the internet.
+
+Each tenant may have two tunnels open at once (`CLOUD_TUNNELS_PER_TENANT`, and
+`max_tunnels` in the tenant's quota). A tunnel closes after 8 hours (`CLOUD_TUNNEL_HOURS`,
+or `"hours"` in the request), when the tenant closes it (`DELETE /tenant/tunnels/{id}`),
+or when the cloud API stops. Every opened tunnel is in the audit log, and the provider sees
+and can close all of them (`GET /provider/tunnels`). Set `CLOUD_TUNNELS=no` to switch the
+feature off.
+
+Quick tunnels are Cloudflare's free testing service: the address changes every time, there is
+no uptime guarantee, and anyone who knows the address can reach the service behind it. Put
+a password in front of anything you publish, and check with your campus IT before using
+this for more than class demos.
+
+### Guests created before the gateway existed
+
+Guests get their gateway, DNS and SSH keys when they are created. Older guests have none of
+these: recreate them, or add the route by hand inside the guest
+(`ip route add default via 10.199.20.1`).
+
 ## The cloud API
 
 The API lets students manage their own tenant through a web page or `curl`, without root on
@@ -147,7 +259,7 @@ addresses and spokes. The API adds the logins, quotas, prices, an audit log and 
 On the main PC, after `cluster.sh up`:
 
 ```bash
-sudo ./cluster.sh cloud install       # Python environment, Redis, secrets (once)
+sudo ./cluster.sh cloud install       # its own Python environment, database, secrets (once)
 sudo ./cluster.sh cloud start         # prints the address, e.g. http://10.20.1.1:36100/docs
 sudo ./cluster.sh cloud admin         # the provider login: admin and a generated password
 ```
@@ -226,7 +338,21 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 | 404 no VM ... in tenant ... | the VM doesn't exist in your tenant |
 | 409 cluster: ... | the hub refused, and the message says why (name taken, subnet full, ...) |
 | 502 cluster: hub not reachable | the hub VM is down: `sudo ./cluster.sh list` |
-| 503 job queue | Redis is down: `sudo ./cluster.sh cloud status` |
+
+### Tenants made with hubctl
+
+The API only lists tenants and VMs it created itself. If you made some with `hubctl` before
+starting the API (or alongside it), the provider won't see them in `GET /provider/tenants`.
+`GET /provider/unmanaged` lists them, and `POST /provider/import` adopts them. An imported
+tenant gets the default quota and no users yet, so give it an admin:
+
+```json
+POST /provider/users
+{"username": "alice", "password": "alice-pass-1", "role": "consumer", "tenant": "tenant-a", "tenant_admin": true}
+```
+
+From then on it behaves like any other tenant. If you keep using `hubctl` and the API side by
+side, run the import again now and then.
 
 The full list of calls, the rules behind them and how they map to the CCRA are in
 `cloud/README.md`. The API's settings are the `CLOUD_*` lines in `cluster.conf`.
@@ -294,7 +420,7 @@ Everything ends up in `logs/` on the PC where you ran the command:
 | `logs/vm/<name>.console.log` | each VM's serial console, all boots |
 | `logs/build/` | the image builds (Packer output, installer console) |
 | `logs/commands/<tool>.log` | every command `cluster.sh` ran on this PC (qemu, ip, ...) |
-| `logs/cloud/` | the cloud API (api, worker, meter, redis) |
+| `logs/cloud/` | the cloud API (api, worker, meter) |
 | `logs/nodes/<name>/` | logs copied from inside the VMs by `logs collect` |
 
 ```bash
@@ -345,7 +471,8 @@ spoke can still talk to each other.
 ## Settings
 
 All settings are in `cluster.conf`, and are copied into the images when you build them.
-Rebuild after changing anything except the `CLOUD_*` lines.
+After changing one, run `sudo ./cluster.sh update` to bring it to the running VMs (see
+Updating a running cluster); the `CLOUD_*` lines only need `cloud restart`.
 
 | Setting | Default | |
 |---|---|---|
@@ -358,10 +485,71 @@ Rebuild after changing anything except the `CLOUD_*` lines.
 | `HUB_SCHEDULABLE` | yes | the hub also runs guests |
 | `GUEST_HOST_RESERVE` | 512 | MB of each node's RAM never given to guests |
 | `TRACE` | changes | command journal: `changes`, `all` or `off` |
+| `TENANT_INTERNET` | on | internet for new tenants (`hubctl tenant set NAME internet on\|off` per tenant) |
+| `JUMP_PORT` | 45222 | SSH jump host, on the hub and on the main PC's campus side |
+| `EDGE`, `EDGE_IF` | yes, (default route NIC) | forward `JUMP_PORT` from the campus NIC to the hub |
+| `WEBCONSOLE_PORTS`, `WEBCONSOLE_MINUTES` | 45300-45399, 60 | ttyd web consoles on the hub |
 | `CLOUD_PORT` | 36100 | the cloud API |
+| `CLOUD_QUEUE` | redis | the API's job queue: `redis` (private instance) or `sqlite` (no Redis at all) |
+| `CLOUD_TUNNELS`, `CLOUD_TUNNEL_HOURS`, `CLOUD_TUNNELS_PER_TENANT` | yes, 8, 2 | Cloudflare quick tunnels |
 
 Settings that differ per PC (host ID, uplink NIC) are in `host.conf`, written by `host init`.
 
+
+## Updating a running cluster
+
+`sudo ./cluster.sh update` copies the lab scripts and `cluster.conf` from this folder into the
+running hub and spokes and restarts their services. The hub keeps its tenants, guests and keys,
+so this is the way to bring new kit features to an existing cluster. It also installs packages
+the hub newly needs (ttyd) and restarts the cloud API if it runs. `update hub` or
+`update spokes` does only one side. Each node's output goes to `logs/update.log`.
+
+After an update that adds guest access (or on a new cluster), this is a quick check:
+
+```bash
+sudo ./cluster.sh update
+sudo ./cluster.sh hubctl tenants                   # every tenant shows its GATEWAY
+sudo ./cluster.sh hubctl key add tenant-a "$(cat ~/.ssh/id_ed25519.pub)"
+sudo ./cluster.sh hubctl vm add tenant-a check1    # a new guest gets the gateway and the key
+sudo ./cluster.sh hubctl vm console check1         # inside: ping -c1 1.1.1.1 works,
+                                                   # ping a guest of another tenant does not
+ssh -J t-tenant-a@10.20.0.2:45222 cirros@<check1's address>   # from the main PC
+sudo ./cluster.sh edge status                      # the campus address for the same from outside
+```
+
+Settings that change how the VMs themselves are built (`*_MEM`, `DISK_SIZE`, `UNDERLAY_*`,
+`IP_MODE`) still need `build` and new VMs.
+
+## What stays in the folder
+
+Everything the kit creates lives inside its own folder, so you can copy it, run two copies side
+by side, or delete it to remove the lab:
+
+| Folder | Contents |
+|---|---|
+| `state/` | SSH key, join token, VM disks and sockets; the cloud API's Python environment, database, private Redis and cloudflared (`state/cloud/`); Packer's plugins and ISO cache (`state/packer/`); temporary files (`state/tmp/`) |
+| `images/` | the built hub and spoke images |
+| `logs/` | every log |
+| `host.conf` | this PC's identity (multi-PC) |
+
+The kit installs no system packages and starts no system services. The cloud API runs its own
+Redis, with its data and a Unix socket in `state/cloud/` and no network port. It uses a
+`redis-server` program if the PC has one, and otherwise builds one into `state/cloud/redis`
+(this needs `make` and a C compiler). `cloudflared` is downloaded into `state/cloud/bin`. SSH
+ignores `~/.ssh/config` and never writes `known_hosts`, Packer doesn't use `~/.config/packer`,
+and pip doesn't use `~/.cache`. The tools it needs (QEMU, Packer, socat, iproute2, python3)
+must already be there.
+
+What it can't keep in the folder is the network of the PC itself, because a bridge or a
+firewall rule only exists in the kernel. These are added while the lab runs and removed again:
+
+| Change | Added by | Removed by |
+|---|---|---|
+| bridge `br-under`, a `tap-<vm>` per VM | `init`, `up`, `spoke add` | `rm`, `net-down` |
+| iptables `FORWARD` rule for `br-under` (when Docker or ufw filter bridges) | `net-up` | `net-down` |
+| iptables forward of port 45222 to the hub, routes to the tenant subnets | `up`, `edge up` | `edge down`, `net-down` |
+| `net.ipv4.ip_forward=1` (needed for that forward) | `edge up` | `edge down`, `net-down` (back to its old value) |
+| three systemd units for the cloud API | `cloud enable` (optional) | `cloud disable` |
 
 ## Command reference
 
@@ -382,6 +570,8 @@ Settings that differ per PC (host ID, uplink NIC) are in `host.conf`, written by
 | `logs`, `logs tail NAME`, `logs collect`, `logs commands [TOOL]` | logs and the command journal |
 | `host init ID [NIC]`, `host show`, `host export` | multi-PC setup |
 | `net-up`, `net-down`, `mtu-check` | the underlay network |
+| `edge up\|down\|status` | main PC: the jump host port from campus, routes to tenant subnets |
+| `update [all\|hub\|spokes]` | bring changed lab scripts and settings to the running VMs |
 | `cloud install\|start\|stop\|status\|logs\|admin\|enable\|disable\|test` | the cloud API |
 
 `hubctl` (through `cluster.sh hubctl`, or on the hub itself):
@@ -389,7 +579,10 @@ Settings that differ per PC (host ID, uplink NIC) are in `host.conf`, written by
 | Command | |
 |---|---|
 | `nodes`, `node del NAME` | members and their state; remove one |
-| `tenant add NAME VNI [SUBNET]`, `tenant del NAME`, `tenants` | tenant networks |
+| `tenant add NAME VNI [SUBNET]`, `tenant del NAME`, `tenants` | tenant networks, with gateway and internet state |
+| `tenant set NAME internet on\|off` | internet for the tenant's guests |
+| `key add TENANT 'KEY'`, `key del TENANT FINGERPRINT`, `keys TENANT` | the tenant's SSH keys (jump host, new guests) |
+| `console start GUEST SID CRED`, `console stop SID`, `consoles` | web consoles (called by the cloud API) |
 | `ips [TENANT]` | address allocations and the next free one |
 | `vm add TENANT NAME [NODE] [--image I] [--ip A] [--mem MB] [--cpus N] [--disk SIZE]` | create a guest |
 | `vm info NAME`, `vm console NAME`, `vm del NAME`, `vms` | guests |
@@ -444,6 +637,12 @@ As alice, create VMs until the quota stops you. As an auditor, find that refusal
 `/audit/journal?node=hv101&tool=virsh`. What would a VM created with `hubctl` directly look
 like in the two logs?
 
+**E11: The tenant router.** From a guest of tenant-a, ping a guest of tenant-b, a spoke
+(10.20.1.101) and the internet. Which work, and which nftables rule decides each one
+(`hubctl exec hub nft list ruleset`)? Switch the tenant's internet off and on, and watch the
+`masquerade` rule change. Then log in through the jump host and try to reach tenant-b's
+guest from there: what stops you?
+
 
 ## Troubleshooting
 
@@ -461,5 +660,13 @@ like in the two logs?
 | guests on different spokes can't talk | `hubctl tenants` should list a tunnel per spoke; check the MTU on the switch |
 | `build` refuses | VMs still use the old image: `rm` them first |
 | a worker PC can't reach the hub | the main PC is up, `host show` lists the uplink NIC, same switch or VLAN, `net-up` done |
+| guests have no internet | `hubctl tenants` (INTERNET on?), the guest has a default route via .1 (created after the update?), `hubctl exec hub nft list table inet lab_fw` |
+| `ssh -J` says Permission denied | the key is not in `hubctl keys TENANT`, or you used another tenant's `t-` account |
+| `ssh -J` times out from campus | `sudo ./cluster.sh edge status`; a campus firewall may block port 45222 |
+| web console URL answers 404 | it was used once already, or expired: open a new one |
+| web console says ttyd is not installed | `sudo ./cluster.sh update hub` installs it |
 | cloud API doesn't answer | `sudo ./cluster.sh cloud logs api`; is port 36100 taken? |
-| cloud jobs stay queued | `sudo ./cluster.sh cloud status`: the worker or Redis is not running |
+| cloud jobs stay queued | `sudo ./cluster.sh cloud status`: the worker or the private Redis is not running (`cloud start`) |
+| `cloud install` says no redis-server and no make/cc | install `make` and `gcc`, or put a `redis-server` binary on PATH, or set `CLOUD_QUEUE=sqlite` |
+| a tunnel answers 502 "no public address" | the main PC can't reach Cloudflare (UDP 7844 or TCP 443); try `CLOUD_TUNNEL_PROTOCOL=http2` |
+| a tunnel URL opens but shows an error | the service in the guest isn't listening on that port, or the guest has no route back (created before the gateway) |
