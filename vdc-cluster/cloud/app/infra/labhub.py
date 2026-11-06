@@ -28,6 +28,7 @@ REGISTRY = {
     "tenants": ["name", "vni", "subnet", "internet"],
     "vms":     ["name", "tenant", "node", "image", "ip", "mem", "mac", "cpus"],
     "images":  ["name", "type", "mem", "disk", "user", "sha256", "size_mb"],
+    "ports":   ["name", "port"],                  # campus SSH port per guest (cluster.sh edge)
 }
 
 

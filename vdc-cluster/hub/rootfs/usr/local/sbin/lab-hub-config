@@ -33,7 +33,10 @@ local=/lab/
 expand-hosts
 addn-hosts=/var/lib/lab/hosts
 log-facility=/var/log/lab/dnsmasq.log
+# DHCP for the tenants' guests (hubctl writes it from the IPAM)
+conf-dir=/etc/dnsmasq.d,*.conf
 DNS
+install -d /etc/dnsmasq.d
 if [ "$IP_MODE" = dhcp ]; then
   cat >>/etc/dnsmasq.conf <<DHCP
 # IP_MODE=dhcp: leases for spokes on the underlay only, pinned per member on join

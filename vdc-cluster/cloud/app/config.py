@@ -44,6 +44,8 @@ METER_INTERVAL = int(os.environ.get("VDC_METER_MINUTES", "5"))
 # access to guests (written by cluster.sh into state/cloud/cloud.env)
 EDGE_HOST = os.environ.get("VDC_EDGE_HOST", "")            # the main PC's campus address
 JUMP_PORT = int(os.environ.get("VDC_JUMP_PORT", "45222"))
+EDGE = os.environ.get("VDC_EDGE", "yes") == "yes"          # campus ports forwarded (cluster.sh edge)
+CONSOLE_PORTS_DIRECT = EDGE and bool(os.environ.get("VDC_WEBCONSOLE_PORTS", "45300-45399"))
 GUEST_PASSWORD = os.environ.get("VDC_GUEST_PASSWORD", "vdclab")
 CONSOLE_MINUTES = int(os.environ.get("VDC_WEBCONSOLE_MINUTES", "60"))
 

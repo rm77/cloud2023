@@ -31,9 +31,11 @@
 #                                        address = next free one of the tenant subnet (or --ip);
 #                                        node = Ready node with most free RAM (or NODE / --node)
 #   hubctl vm del NAME
-#   hubctl vm info NAME                  image, address, MAC, node, login
+#   hubctl vm info NAME                  image, address, MAC, node, login, SSH port
 #   hubctl vm console NAME               (Ctrl-] to leave)
 #   hubctl vms
+#   hubctl ports                         campus SSH port of every guest (VM_SSH_PORTS), forwarded
+#                                        by the main PC: ssh -p PORT user@<lab PC>
 #
 #   hubctl exec NODE CMD...              run a command on a node (hub or spoke)
 #   hubctl apply                         rebuild the hub side of the overlay
@@ -49,6 +51,8 @@ KEYDIR=$S/keys            # t-<tenant>: the tenant's SSH keys (jump host + new g
 CONSOLES=/run/lab/console # SID: "PORT PID GUEST" of a running web console
 FIREWALL=/etc/nftables.nft
 VMS=$S/vms                # GUEST TENANT NODE IMAGE IP MEM MAC CPUS
+PORTS=$S/ports            # GUEST PORT: the guest's SSH on the main PC's campus address
+VM_SSH_PORTS=${VM_SSH_PORTS-46000-46999}   # empty = no per-guest SSH ports
 IMAGES=$S/images          # NAME TYPE MEM DISK USER SHA256 SIZE_MB
 IMGDIR=$S/www/images      # served to the nodes as http://hub:API_PORT/images/NAME.qcow2
 CAPS=$S/caps              # <node>: "MEM_MB CPUS" reported by the agent
@@ -57,7 +61,7 @@ TOKEN_F=$S/token
 LOGF=$LAB_LOG/hub.log
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=5 -o LogLevel=ERROR -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$KNOWN"
 
-usage() { sed -n '2,32s/^# \{0,1\}//p' "$0"; }
+usage() { sed -n '2,/^# Internal/s/^# \{0,1\}//p' "$0"; }
 logf() { log "$*" >>"$LOGF" 2>/dev/null || true; }
 lock() { exec 9>/run/lab-hub.lock; flock -w 30 9 || die "another hubctl is running"; }
 has() { awk -v k="$2" '$1==k {f=1} END {exit !f}' "$1"; }
@@ -144,8 +148,76 @@ cmd_apply() {
     esac
   done
   jump_sync
+  ports_sync
+  guest_dhcp
   fw_apply
 }
+
+# DHCP for the guests, from the IPAM: each guest's MAC gets the address it was given, with the
+# tenant's gateway and DNS - so an image that forgets its seed address on reboot (CirrOS), or
+# one with no seed at all, still comes up right. Unknown MACs get nothing ('static' ranges).
+DHCP_CONF=/etc/dnsmasq.d/lab-tenants.conf
+DHCP_GUESTS=$S/guest-dhcp
+mask_of() {   # 24 -> 255.255.255.0
+  _m=$(( (0xffffffff << (32 - $1)) & 0xffffffff ))
+  echo "$((_m >> 24 & 255)).$((_m >> 16 & 255)).$((_m >> 8 & 255)).$((_m & 255))"
+}
+guest_dhcp() {
+  awk '$7 ~ /:/ && $5 ~ /^[0-9.]+$/ {print $7 "," $5 "," $1}' "$VMS" >"$DHCP_GUESTS.tmp"
+  mv "$DHCP_GUESTS.tmp" "$DHCP_GUESTS"; chmod 644 "$DHCP_GUESTS"
+  install -d /etc/dnsmasq.d
+  {
+    echo "# vdc-cluster: DHCP for the tenants' guests - written by hubctl (do not edit)"
+    echo "dhcp-hostsfile=$DHCP_GUESTS"
+    while read -r _t _v _s _; do
+      [ -n "$_t" ] || continue
+      _s=${_s:-192.168.$_v.0/24}; _gw=$(gw_of "$_s")
+      echo "dhcp-range=set:t$_v,${_s%/*},static,$(mask_of "${_s#*/}"),12h"
+      echo "dhcp-option=tag:t$_v,option:router,$_gw"
+      echo "dhcp-option=tag:t$_v,option:dns-server,$_gw"
+      echo "dhcp-option=tag:t$_v,option:domain-search,lab"
+    done <"$TENANTS"
+  } >"$DHCP_CONF.tmp"
+  if cmp -s "$DHCP_CONF.tmp" "$DHCP_CONF"; then
+    rm -f "$DHCP_CONF.tmp"
+    killall -HUP dnsmasq 2>/dev/null || true       # rereads the guests' leases
+  else
+    mv "$DHCP_CONF.tmp" "$DHCP_CONF"
+    step "DHCP for the guests of $(awk 'NF >= 2' "$TENANTS" | wc -l | tr -d ' ') tenant(s)"
+    rc-service dnsmasq restart >/dev/null 2>&1 || killall -HUP dnsmasq 2>/dev/null || true
+  fi
+}
+
+# one campus SSH port per guest, from VM_SSH_PORTS; cluster.sh edge on the main PC forwards
+# <campus address>:PORT to the guest's port 22. Kept while the guest exists. (under the lock)
+port_alloc() {
+  _lo=${VM_SSH_PORTS%-*} _hi=${VM_SSH_PORTS#*-} _p=${VM_SSH_PORTS%-*}
+  while [ "$_p" -le "$_hi" ]; do
+    awk -v p="$_p" '$2==p {f=1} END {exit !f}' "$PORTS" || { echo "$_p"; return 0; }
+    _p=$((_p + 1))
+  done
+  return 1
+}
+ports_sync() {
+  [ -e "$PORTS" ] || : >"$PORTS"
+  # no port without a guest; none at all when switched off
+  if [ -n "$VM_SSH_PORTS" ]; then
+    awk 'NR == FNR {g[$1] = 1; next} ($1 in g)' "$VMS" "$PORTS" >"$PORTS.tmp"
+  else
+    : >"$PORTS.tmp"
+  fi
+  mv "$PORTS.tmp" "$PORTS"
+  [ -n "$VM_SSH_PORTS" ] || return 0
+  while read -r _g _; do
+    [ -n "$_g" ] || continue
+    has "$PORTS" "$_g" && continue
+    _p=$(port_alloc) || { echo "warning: no free SSH port in $VM_SSH_PORTS for $_g" >&2; continue; }
+    step "campus SSH port $_p for guest $_g"
+    echo "$_g $_p" >>"$PORTS"
+  done <"$VMS"
+  chmod 644 "$PORTS"
+}
+guest_port() { [ -e "$PORTS" ] && field "$PORTS" "$1" 2; }
 
 tenant_internet() { awk -v t="$1" '$1==t {print ($4 != "" ? $4 : "on"); exit}' "$TENANTS"; }
 
@@ -208,6 +280,7 @@ table inet lab_fw {
     iifname "br-t*" ct state established,related accept
     iifname "br-t*" icmp type echo-request accept
     iifname "br-t*" meta l4proto { tcp, udp } th dport 53 accept
+    iifname "br-t*" udp dport 67 accept
     iifname "br-t*" drop
     tcp dport ${WEBCONSOLE_PORTS:-45300-45399} ip saddr != $LABPC_IP drop
   }
@@ -655,9 +728,12 @@ cmd_vm_add() {   # TENANT NAME [NODE] [--image I] [--node N] [--ip A] [--mem MB]
   if [ -n "$ip" ]; then ip_check "$t" "$ip"; else ip=$(ip_alloc "$t") || die "tenant $t: no free address in $sn"; fi
   mac=$(new_mac)
   echo "$g $t $node $img $ip $mem $mac $cpus" >>"$VMS"
+  ports_sync
+  guest_dhcp
+  sshp=$(guest_port "$g")
   flock -u 9
   logf "vm add: $g tenant=$t node=$node image=$img ip=$ip mac=$mac mem=$mem"
-  echo "placing $g (tenant $t, image $img) on $node: $ip/${sn#*/}, $mac, ${mem} MB, $disk"
+  echo "placing $g (tenant $t, image $img) on $node: $ip/${sn#*/}, $mac, ${mem} MB, $disk${sshp:+, SSH port $sshp}"
   gw=$(gw_of "$sn")
   args="add $t $g --image $img --type $itype --sha $isha --ip $ip/${sn#*/} --mac $mac --mem $mem --cpus $cpus --disk $disk --gw $gw --dns $gw"
   if [ -s "$KEYDIR/t-$t" ]; then args="$args --keys $(base64 <"$KEYDIR/t-$t" | tr -d '\n')"; fi
@@ -667,10 +743,11 @@ cmd_vm_add() {   # TENANT NAME [NODE] [--image I] [--node N] [--ip A] [--mem MB]
   else
     run_on "$node" "lab-agent sync >/dev/null; lab-guest $args" && ok=1 || ok=0
   fi
-  if [ "$ok" = 0 ]; then lock; del_line "$VMS" "$g"; die "creating $g on $node failed (address $ip released)"; fi
+  if [ "$ok" = 0 ]; then lock; del_line "$VMS" "$g"; ports_sync; die "creating $g on $node failed (address $ip released)"; fi
   case $itype in
     none) echo "note: image type 'none' gets no seed - $ip is reserved but must be configured inside the guest" ;;
-    *) echo "login on the console: $iuser / ${GUEST_PASSWORD:-vdclab}   (hubctl vm console $g)" ;;
+    *) echo "login on the console: $iuser / ${GUEST_PASSWORD:-vdclab}   (hubctl vm console $g)"
+       if [ -n "$sshp" ]; then echo "ssh from campus: ssh -p $sshp $iuser@<lab PC's campus address>"; fi ;;
   esac
 }
 
@@ -795,7 +872,9 @@ cmd_vm() {
       run_on "$node" "lab-guest del $2" || echo "warning: $node unreachable, removing from registry" >&2
       lock
       del_line "$VMS" "$2"
-      logf "vm del: $2 (address released)" ;;
+      ports_sync
+      guest_dhcp
+      logf "vm del: $2 (address and SSH port released)" ;;
     info)
       [ $# -eq 2 ] || die "usage: hubctl vm info NAME"
       has "$VMS" "$2" || die "no guest $2"
@@ -809,7 +888,9 @@ cmd_vm() {
         echo "size     ${m:-192} MB RAM, ${c:-1} vCPU"
         echo "gateway  $(gw_of "$sn")  (DNS too), internet $(tenant_internet "$t")"
         echo "login    $(field "$IMAGES" "${i:-cirros}" 5) / ${GUEST_PASSWORD:-vdclab}   (hubctl vm console $g)"
-        echo "ssh      ssh -J t-$t@<lab PC>:${JUMP_PORT:-45222} $(field "$IMAGES" "${i:-cirros}" 5)@$a"
+        p=$(guest_port "$g")
+        [ -z "$p" ] || echo "ssh      ssh -p $p $(field "$IMAGES" "${i:-cirros}" 5)@<lab PC>   (campus port $p)"
+        echo "jump     ssh -J t-$t@<lab PC>:${JUMP_PORT:-45222} $(field "$IMAGES" "${i:-cirros}" 5)@$a"
       done ;;
     console)
       [ $# -eq 2 ] || die "usage: hubctl vm console NAME"
@@ -844,6 +925,10 @@ case ${1:-help} in
   images) cmd_image list ;;
   vm) shift; cmd_vm "$@" ;;
   vms) cmd_vm list ;;
+  ports)
+    lock; ports_sync; flock -u 9
+    printf '%-14s %-12s %-16s %s\n' GUEST TENANT ADDRESS PORT
+    awk 'NR == FNR {p[$1] = $2; next} ($1 in p) {printf "%-14s %-12s %-16s %s\n", $1, $2, $5, p[$1]}' "$PORTS" "$VMS" ;;
   exec) shift; [ $# -ge 2 ] || die "usage: hubctl exec NODE CMD..."; n=$1; shift; run_on "$n" "$*" ;;
   apply) lock; cmd_apply ;;
   init) cmd_init ;;

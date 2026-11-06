@@ -13,7 +13,8 @@
 # Each guest gets a qcow2 overlay plus a seed ISO (label "cidata", NoCloud) that hands
 # over hostname, login password and the address the hub allocated:
 #   cloud-init images  user-data (#cloud-config) + network-config v2 (static, matched by MAC)
-#   cirros             user-data shell script that sets the address
+#   cirros             JSON meta-data + user-data shell script (first boot); the hub's DHCP
+#                      gives the same address on every boot
 #   none               no seed: the address is reserved but not applied
 set -eu
 . /usr/local/lib/lab/lib.sh
@@ -46,7 +47,8 @@ write_seed() {   # NAME TYPE IP/LEN MAC SEED_ISO   (+ $gw $dns $keys from cmd_ad
   # the tenant's SSH keys (hubctl key add), one per line
   keyfile=$d/keys
   if [ -n "$keys" ]; then printf '%s' "$keys" | base64 -d >"$keyfile" 2>/dev/null || : >"$keyfile"; else : >"$keyfile"; fi
-  printf 'instance-id: %s-%s\nlocal-hostname: %s\n' "$1" "$(randhex 4)" "$1" >"$d/meta-data"
+  # JSON: CirrOS reads meta-data only as JSON, and JSON is also YAML for cloud-init
+  printf '{"instance-id": "%s-%s", "local-hostname": "%s"}\n' "$1" "$(randhex 4)" "$1" >"$d/meta-data"
   case $2 in
     cloud-init)
       cat >"$d/user-data" <<UD
@@ -57,7 +59,7 @@ manage_etc_hosts: true
 password: ${GUEST_PASSWORD:-vdclab}
 chpasswd:
   expire: false
-ssh_pwauth: true
+ssh_pwauth: $([ "${GUEST_SSH_PASSWORD:-no}" = yes ] && echo true || echo false)
 UD
       if [ -s "$keyfile" ]; then
         echo "ssh_authorized_keys:" >>"$d/user-data"
@@ -88,12 +90,15 @@ NC
     cirros)
       cat >"$d/user-data" <<UD
 #!/bin/sh
-# vdc-cluster: address allocated by the hub's IPAM, applied at first boot
+# vdc-cluster: runs once, at first boot. On every boot dhcpcd also asks the hub, which
+# hands out the same address (hubctl guest DHCP); this is the fallback if it did not answer.
 dev=\$(ip -o link | awk -F': ' '/$4/ {print \$2; exit}')
 dev=\${dev:-eth0}
-ip addr flush dev "\$dev"
-ip addr add $3 dev "\$dev"
 ip link set "\$dev" up
+if ! ip -4 addr show dev "\$dev" | grep -q " ${3%/*}/"; then
+  ip addr flush dev "\$dev"
+  ip addr add $3 dev "\$dev"
+fi
 echo "cirros:${GUEST_PASSWORD:-vdclab}" | chpasswd 2>/dev/null || true
 hostname $1
 UD

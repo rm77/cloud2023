@@ -133,8 +133,19 @@ tenant-a), and guests get it as their gateway and DNS server when they are creat
 guests reach the internet, and nothing else: tenants can't reach each other, the spokes or
 the lab PCs. The main lab PC is the exception, so staff can reach every guest from it.
 
-There are four ways to a guest: SSH through the jump host, the web console, a Cloudflare
-tunnel from the internet, and, for staff, directly from the main PC.
+The main PC's campus address (for example 10.28.84.254) is the way into the lab. These ports
+on it lead inside:
+
+| Port on the main PC | Goes to | |
+|---|---|---|
+| 36100 | cloud API | portal, `/docs`, web consoles through the API |
+| 45022 | hub, port 22 | staff SSH to the hub |
+| 45222 | hub, port 45222 | tenant jump host |
+| 45300-45399 | hub, same port | web consoles (ttyd), directly |
+| 46000-46999 | one guest each, port 22 | SSH straight to a guest |
+
+So a guest can be reached with its own SSH port, through the jump host, in the web console,
+through a Cloudflare tunnel from the internet, and, for staff, directly from the main PC.
 
 ### Internet on or off
 
@@ -148,33 +159,75 @@ sudo ./cluster.sh hubctl tenants          # GATEWAY and INTERNET columns
 
 With internet off, guests still reach their gateway, DNS and each other.
 
-### SSH through the jump host
+### SSH keys
 
-Each tenant has an account on the hub, `t-<tenant>`, that can only forward connections into
-that tenant's own subnet. The main PC forwards port 45222 (`JUMP_PORT`) from its campus
-network card to it. To use it, a tenant first registers an SSH public key:
+Guests take SSH keys only, not passwords (`GUEST_SSH_PASSWORD=no`), because their SSH port is
+open on campus. A tenant registers its public key before creating guests:
 
 ```bash
 sudo ./cluster.sh hubctl key add tenant-a "$(cat ~/.ssh/id_ed25519.pub)"
 sudo ./cluster.sh hubctl keys tenant-a
 ```
 
-or, as the tenant, with `POST /tenant/keys` in the cloud API. Then, from any computer on the
-campus network:
+or, as the tenant, with `POST /tenant/keys` in the cloud API. The key goes into every guest
+created afterwards, for the image's default user, and opens the jump host too. The password
+(`GUEST_PASSWORD`) still works on the console. CirrOS guests ignore the setting and keep
+accepting the password over SSH.
+
+### SSH with the guest's own port
+
+When a guest is created, the hub gives it a port from 46000-46999 (`VM_SSH_PORTS`) and the
+main PC forwards that port to the guest's port 22. From any computer on campus:
 
 ```bash
-ssh -J t-tenant-a@<main PC's campus address>:45222 ubuntu@10.199.20.10
+ssh -p 46000 ubuntu@10.28.84.254
 ```
 
-The same key is put into every guest created afterwards (for the image's default user), so no
-password is needed on either hop. `GET /tenant/access` prints the exact command for each guest
-and a ready-made `~/.ssh/config`. On the main PC itself, use the hub's address instead:
-`ssh -J t-tenant-a@10.20.0.2:45222 ...`.
+`hubctl ports` lists every guest's port, `hubctl vm info a1` shows its command, and in the
+cloud API `GET /tenant/vms/a1` and `GET /tenant/access` have it as `ssh_port` and `ssh`, with
+a ready-made `~/.ssh/config`. The port stays with the guest until it is deleted; a later guest
+may then get the same port, and ssh will warn that the host key changed
+(`ssh-keygen -R "[10.28.84.254]:46000"`).
 
-`sudo ./cluster.sh edge status` shows the forwarded port and the main PC's campus address.
-`cluster.sh up` sets the forward up; `edge down` removes it. Set `EDGE_IF` in `cluster.conf`
-if the campus network card is not the one with the default route, or `EDGE=no` to keep the
-jump host reachable only from the lab PCs.
+Guests that existed before this feature get their ports with `sudo ./cluster.sh update`. They
+were created when password SSH was still allowed, so it is still allowed on them: recreate them
+to change that.
+
+### SSH through the jump host
+
+A single port reaches all of a tenant's guests, including ones without a port of their own.
+Each tenant has an account on the hub, `t-<tenant>`, that accepts the tenant's keys and can
+only forward connections into that tenant's own subnet:
+
+```bash
+ssh -J t-tenant-a@10.28.84.254:45222 ubuntu@10.199.20.10
+```
+
+`GET /tenant/access` has this command for each guest as `ssh_jump`. On the main PC itself, use
+the hub's address instead: `ssh -J t-tenant-a@10.20.0.2:45222 ...`.
+
+### The ports on the main PC
+
+`cluster.sh up` sets up the forwards, `sudo ./cluster.sh edge status` lists them all (with
+each guest's port), and `edge down` removes them. They follow `hubctl vm add` and `vm del` by
+themselves; after creating guests on the hub directly, run `sudo ./cluster.sh edge sync`.
+
+| Setting | Default | |
+|---|---|---|
+| `EDGE_ALLOW` | 0.0.0.0/0 | who may connect, e.g. `10.28.84.0/24`, or several: `10.28.84.0/24,10.30.0.0/16` |
+| `EDGE_IF` | the NIC with the default route | the campus network card |
+| `EDGE_HUB_SSH`, `JUMP_PORT`, `WEBCONSOLE_PORTS`, `VM_SSH_PORTS` | 45022, 45222, 45300-45399, 46000-46999 | the ports; an empty value switches that forward off |
+| `EDGE` | yes | `no` keeps everything reachable from the lab PCs only |
+
+Only connections to the main PC's own address on that card are forwarded. The port
+forwards don't work from the main PC itself, which reaches everything directly anyway (below).
+
+The hub takes keys only. Staff log in to it from campus with the lab key, or with a key added
+to the hub's `/root/.ssh/authorized_keys`:
+
+```bash
+ssh -p 45022 -i state/id_lab root@10.28.84.254
+```
 
 ### Web console
 
@@ -185,7 +238,19 @@ real console. The URL works once and closes after 60 minutes (`WEBCONSOLE_MINUTE
 the tab closes; ask for a new one to reconnect. The provider can open any guest's console
 with `POST /provider/vms/{name}/console`.
 
-On the hub this is `hubctl console start|stop`, but only the API should call it.
+The answer also has a `direct_url`, the same console on ttyd itself:
+`http://10.28.84.254:45300/console/<id>/`. That one asks first for ttyd's own login, given as
+`direct_login` (`lab / <password>`), then for the guest's. Each console has its own port from
+45300-45399; `hubctl consoles` lists them.
+
+Staff can open one without the API:
+
+```bash
+sudo ./cluster.sh hubctl console start a1 $(openssl rand -hex 16) MyConsolePass1
+```
+
+This prints the port. Then open `http://10.28.84.254:<port>/console/<SID>/` and log in as `lab`
+/ `MyConsolePass1`. The address must have the `/console/<SID>/` path: the bare port answers 404.
 
 ### From the main PC (staff)
 
@@ -486,9 +551,12 @@ Updating a running cluster); the `CLOUD_*` lines only need `cloud restart`.
 | `GUEST_HOST_RESERVE` | 512 | MB of each node's RAM never given to guests |
 | `TRACE` | changes | command journal: `changes`, `all` or `off` |
 | `TENANT_INTERNET` | on | internet for new tenants (`hubctl tenant set NAME internet on\|off` per tenant) |
+| `GUEST_SSH_PASSWORD` | no | `yes` lets the guest password work over SSH too (cloud-init images) |
+| `EDGE`, `EDGE_IF`, `EDGE_ALLOW` | yes, (default route NIC), 0.0.0.0/0 | forward the ports below from the campus NIC, for these sources |
+| `EDGE_HUB_SSH` | 45022 | campus port of the hub's SSH |
 | `JUMP_PORT` | 45222 | SSH jump host, on the hub and on the main PC's campus side |
-| `EDGE`, `EDGE_IF` | yes, (default route NIC) | forward `JUMP_PORT` from the campus NIC to the hub |
-| `WEBCONSOLE_PORTS`, `WEBCONSOLE_MINUTES` | 45300-45399, 60 | ttyd web consoles on the hub |
+| `WEBCONSOLE_PORTS`, `WEBCONSOLE_MINUTES` | 45300-45399, 60 | ttyd web consoles on the hub, forwarded with the same ports |
+| `VM_SSH_PORTS` | 46000-46999 | one campus SSH port per guest |
 | `CLOUD_PORT` | 36100 | the cloud API |
 | `CLOUD_QUEUE` | redis | the API's job queue: `redis` (private instance) or `sqlite` (no Redis at all) |
 | `CLOUD_TUNNELS`, `CLOUD_TUNNEL_HOURS`, `CLOUD_TUNNELS_PER_TENANT` | yes, 8, 2 | Cloudflare quick tunnels |
@@ -514,7 +582,9 @@ sudo ./cluster.sh hubctl vm add tenant-a check1    # a new guest gets the gatewa
 sudo ./cluster.sh hubctl vm console check1         # inside: ping -c1 1.1.1.1 works,
                                                    # ping a guest of another tenant does not
 ssh -J t-tenant-a@10.20.0.2:45222 cirros@<check1's address>   # from the main PC
-sudo ./cluster.sh edge status                      # the campus address for the same from outside
+sudo ./cluster.sh hubctl ports                     # check1 has its own SSH port
+sudo ./cluster.sh edge status                      # the campus address and every forwarded port
+ssh -p <check1's port> cirros@<campus address>     # from another computer on campus
 ```
 
 Settings that change how the VMs themselves are built (`*_MEM`, `DISK_SIZE`, `UNDERLAY_*`,
@@ -547,8 +617,8 @@ firewall rule only exists in the kernel. These are added while the lab runs and 
 |---|---|---|
 | bridge `br-under`, a `tap-<vm>` per VM | `init`, `up`, `spoke add` | `rm`, `net-down` |
 | iptables `FORWARD` rule for `br-under` (when Docker or ufw filter bridges) | `net-up` | `net-down` |
-| iptables forward of port 45222 to the hub, routes to the tenant subnets | `up`, `edge up` | `edge down`, `net-down` |
-| `net.ipv4.ip_forward=1` (needed for that forward) | `edge up` | `edge down`, `net-down` (back to its old value) |
+| iptables chains `VDC-EDGE` and `VDC-EDGE-FWD` (the forwarded ports), routes to the tenant subnets | `up`, `edge up`, `edge sync` | `edge down`, `net-down` |
+| `net.ipv4.ip_forward=1` (needed for the forwards) | `edge up` | `edge down`, `net-down` (back to its old value) |
 | three systemd units for the cloud API | `cloud enable` (optional) | `cloud disable` |
 
 ## Command reference
@@ -570,7 +640,7 @@ firewall rule only exists in the kernel. These are added while the lab runs and 
 | `logs`, `logs tail NAME`, `logs collect`, `logs commands [TOOL]` | logs and the command journal |
 | `host init ID [NIC]`, `host show`, `host export` | multi-PC setup |
 | `net-up`, `net-down`, `mtu-check` | the underlay network |
-| `edge up\|down\|status` | main PC: the jump host port from campus, routes to tenant subnets |
+| `edge up\|down\|status\|sync` | main PC: the campus ports to the hub and the guests, routes to tenant subnets |
 | `update [all\|hub\|spokes]` | bring changed lab scripts and settings to the running VMs |
 | `cloud install\|start\|stop\|status\|logs\|admin\|enable\|disable\|test` | the cloud API |
 
@@ -586,6 +656,7 @@ firewall rule only exists in the kernel. These are added while the lab runs and 
 | `ips [TENANT]` | address allocations and the next free one |
 | `vm add TENANT NAME [NODE] [--image I] [--ip A] [--mem MB] [--cpus N] [--disk SIZE]` | create a guest |
 | `vm info NAME`, `vm console NAME`, `vm del NAME`, `vms` | guests |
+| `ports` | every guest's campus SSH port |
 | `image add NAME URL`, `image del NAME`, `images` | the image catalog |
 | `token` | the join token |
 | `exec NODE CMD` | run a command on any node |
@@ -662,7 +733,11 @@ guest from there: what stops you?
 | a worker PC can't reach the hub | the main PC is up, `host show` lists the uplink NIC, same switch or VLAN, `net-up` done |
 | guests have no internet | `hubctl tenants` (INTERNET on?), the guest has a default route via .1 (created after the update?), `hubctl exec hub nft list table inet lab_fw` |
 | `ssh -J` says Permission denied | the key is not in `hubctl keys TENANT`, or you used another tenant's `t-` account |
-| `ssh -J` times out from campus | `sudo ./cluster.sh edge status`; a campus firewall may block port 45222 |
+| `ssh -J` or `ssh -p 460xx` times out from campus | `sudo ./cluster.sh edge status` (is the guest's port listed? `edge sync`); `EDGE_ALLOW`; a campus firewall may block the port |
+| `ssh -p 460xx` asks for a password, or says Permission denied | the tenant's key was added after the guest was created: recreate it, or put the key in by hand on the console |
+| `ssh -p 460xx` warns the host key changed | the port belonged to a deleted guest before: `ssh-keygen -R "[<campus address>]:460xx"` |
+| a guest has a 169.254.x.x address | it found no DHCP answer: the hub hands out each guest's IPAM address by DHCP (`/etc/dnsmasq.d/lab-tenants.conf`); `sudo ./cluster.sh update hub`, then restart the guest |
+| web console refused on the campus address | open `http://<campus address>:<port>/console/<SID>/`, not just the port; `edge status` should list the console range |
 | web console URL answers 404 | it was used once already, or expired: open a new one |
 | web console says ttyd is not installed | `sudo ./cluster.sh update hub` installs it |
 | cloud API doesn't answer | `sudo ./cluster.sh cloud logs api`; is port 36100 taken? |

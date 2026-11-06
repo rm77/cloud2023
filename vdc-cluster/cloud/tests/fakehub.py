@@ -28,6 +28,9 @@ class FakeHub:
         if cmd.startswith("hubctl "):
             return self.hubctl(shlex.split(cmd)[1:])
         if "cluster.sh" in " ".join(argv):
+            if "edge" in argv:
+                self.edge_syncs = getattr(self, "edge_syncs", 0) + 1
+                return ""
             return "VM ROLE MAC IP STATE\nhub hub 52:54:00:20:00:02 10.20.0.2 running\n"
         raise labhub.LabError("fakehub: unexpected " + cmd)
 
@@ -37,6 +40,8 @@ class FakeHub:
         if name == "vms":
             return "".join(f"{n} {v['tenant']} {v['node']} {v['image']} {v['ip']} {v['mem']} {v['mac']} {v['cpus']}\n"
                            for n, v in self.vms.items())
+        if name == "ports":
+            return "".join(f"{n} {46000 + i}\n" for i, n in enumerate(self.vms))
         if name == "images":
             return "".join(l + "\n" for l in self.images.values())
         return ""

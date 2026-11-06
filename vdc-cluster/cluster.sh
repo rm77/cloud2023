@@ -20,7 +20,7 @@
 #   ./cluster.sh logs collect [NAME|all] copy /var/log/lab etc. from nodes into logs/nodes/
 #   ./cluster.sh logs commands [TOOL]    command journal: per-tool counts, or every TOOL call
 #   ./cluster.sh update [all|hub|spokes] copy changed lab scripts into the running VMs (no rebuild)
-#   ./cluster.sh edge up|down|status     main PC: jump host port from campus to the hub, tenant routes
+#   ./cluster.sh edge up|down|status|sync  main PC: campus ports to the hub and guests, tenant routes
 #
 # cloud API (cloud/, main PC): NIST CCRA REST API for providers, tenants and auditors
 #   ./cluster.sh cloud install [--dev]   own Python environment, Redis, cloudflared, secrets in state/cloud/
@@ -148,11 +148,18 @@ tap_init() {   # NAME
   echo "  $t  mtu $UNDERLAY_MTU, port of $UNDERLAY_BR$(running "$n" && echo " ($n running)")"
 }
 
+# the underlay's own route: the kernel drops it when an address on br-under is removed, and
+# without it nothing can be routed via the hub
+underlay_route() {
+  ip route replace "$UNDERLAY_NET/$UNDERLAY_PREFIX" dev "$UNDERLAY_BR" proto kernel scope link src "$LABPC_IP"
+}
+
 cmd_net_up() {
   step "underlay switch: Linux bridge $UNDERLAY_BR with this PC's address"
   ip link show "$UNDERLAY_BR" >/dev/null 2>&1 || ip link add "$UNDERLAY_BR" type bridge
   ip link set "$UNDERLAY_BR" mtu "$UNDERLAY_MTU" up
   ip addr replace "$LABPC_IP/$UNDERLAY_PREFIX" dev "$UNDERLAY_BR"
+  underlay_route
   if [ -n "$UPLINK_NIC" ]; then
     local parent=${UPLINK_NIC%%.*} vid
     step "uplink $UPLINK_NIC into $UNDERLAY_BR: joins the other PCs' underlay"
@@ -173,6 +180,11 @@ cmd_net_up() {
   fi
   bridge_fw_allow
   echo "$UNDERLAY_BR up: $LABPC_IP/$UNDERLAY_PREFIX mtu $UNDERLAY_MTU"
+  local other
+  other=$(ip -4 -o addr show dev "$UNDERLAY_BR" 2>/dev/null | awk -v me="$LABPC_IP" '{split($4, a, "/"); if (a[1] != me) printf "%s ", $4}')
+  if [ -n "$other" ]; then
+    echo "warning: $UNDERLAY_BR also has $other- the hub only trusts $LABPC_IP; remove with: ip addr del <addr> dev $UNDERLAY_BR" >&2
+  fi
 }
 
 cmd_net_down() {
@@ -653,11 +665,19 @@ EOF
 }
 
 # ---------------------------------------------------------------- edge (main PC)
-# The main PC is the edge between the campus network and the lab. It forwards JUMP_PORT
-# on its campus NIC to the hub's jump host, and routes the tenant subnets via the hub, so
-# staff on this PC reach every guest directly.
+# The main PC is the edge between the campus network and the lab: its campus address is the
+# entry point, and these ports on it are forwarded into the lab (from EDGE_ALLOW only):
+#   EDGE_HUB_SSH (45022)          -> hub:22           staff SSH to the hub
+#   JUMP_PORT (45222)             -> hub:45222        tenant jump host
+#   WEBCONSOLE_PORTS (45300-45399)-> hub, same port   ttyd web consoles
+#   one of VM_SSH_PORTS per guest -> <guest>:22       given by the hub (hubctl ports)
+# It also routes the tenant subnets via the hub, so staff on this PC reach every guest.
+# The rules live in two chains of our own, VDC-EDGE (nat) and VDC-EDGE-FWD (filter), rebuilt
+# by 'edge sync' after every guest change.
 EDGE_RT_PROTO=222          # our routes carry "proto 222" (ip route show proto 222)
-: "${JUMP_PORT:=45222}" "${WEBCONSOLE_PORTS:=45300-45399}"
+: "${JUMP_PORT:=45222}" "${WEBCONSOLE_PORTS:=45300-45399}" "${EDGE_ALLOW:=0.0.0.0/0}"
+EDGE_HUB_SSH=${EDGE_HUB_SSH-45022}
+VM_SSH_PORTS=${VM_SSH_PORTS-46000-46999}
 edge_if() {
   if [ -n "${EDGE_IF:-}" ]; then echo "$EDGE_IF"; return; fi
   ip -4 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}'
@@ -677,6 +697,8 @@ edge_clear() {
     iptables -t "$t" -S 2>/dev/null | grep -- '--comment vdc-edge' | sed 's/^-A /-D /' |
       while read -r r; do eval "iptables -t $t $r" 2>/dev/null || true; done
   done
+  iptables -t nat -F VDC-EDGE 2>/dev/null && iptables -t nat -X VDC-EDGE 2>/dev/null || true
+  iptables -t filter -F VDC-EDGE-FWD 2>/dev/null && iptables -t filter -X VDC-EDGE-FWD 2>/dev/null || true
 }
 edge_forward_restore() {
   if [ -f "$ST/edge.ip_forward" ]; then
@@ -684,59 +706,102 @@ edge_forward_restore() {
     rm -f "$ST/edge.ip_forward"
   fi
 }
+edge_on() { iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- '-j VDC-EDGE'; }
 edge_routes() {   # tenant subnets via the hub, from the hub's registry
-  local sn
+  local sn tenants err
   [ "$HOST_ROLE" = main ] && ip link show "$UNDERLAY_BR" >/dev/null 2>&1 || return 0
+  ip -4 -o addr show dev "$UNDERLAY_BR" | grep -q " $LABPC_IP/" ||
+    { echo "warning: $UNDERLAY_BR does not have $LABPC_IP: ./cluster.sh net-up" >&2; return 0; }
+  underlay_route 2>/dev/null || true
+  if ! tenants=$(hub cat /var/lib/lab/tenants 2>&1); then
+    echo "warning: no tenant routes, the hub did not answer: $tenants" >&2; return 0
+  fi
   ip route flush proto "$EDGE_RT_PROTO" 2>/dev/null || true
-  for sn in $(hub cat /var/lib/lab/tenants 2>/dev/null | awk 'NF >= 2 {print ($3 != "" ? $3 : "192.168." $2 ".0/24")}'); do
-    ip route replace "$sn" via "$HUB_IP" dev "$UNDERLAY_BR" proto "$EDGE_RT_PROTO" 2>/dev/null || true
+  for sn in $(echo "$tenants" | awk 'NF >= 2 {print ($3 != "" ? $3 : "192.168." $2 ".0/24")}'); do
+    # src: the hub lets only LABPC_IP into tenant subnets, whatever else br-under carries
+    err=$(ip route replace "$sn" via "$HUB_IP" dev "$UNDERLAY_BR" src "$LABPC_IP" proto "$EDGE_RT_PROTO" 2>&1) ||
+      echo "warning: route $sn via $HUB_IP: $err" >&2
   done
+}
+edge_guest_ports() {   # "PORT ADDRESS GUEST" per guest, from the hub
+  [ -n "$VM_SSH_PORTS" ] || return 0
+  hub hubctl ports 2>/dev/null | awk 'NR > 1 && $4 ~ /^[0-9]+$/ && $3 ~ /^[0-9.]+$/ {print $4, $3, $1}'
+}
+edge_rules() {   # CAMPUS_IF: (re)write the two chains; the jumps into them are added by 'edge up'
+  local i=$1 n=0 port addr guest
+  iptables -t nat -N VDC-EDGE 2>/dev/null || iptables -t nat -F VDC-EDGE
+  iptables -t filter -N VDC-EDGE-FWD 2>/dev/null || iptables -t filter -F VDC-EDGE-FWD
+  # what was forwarded may pass, and its answers may come back (ctstate DNAT: both directions)
+  iptables -t filter -A VDC-EDGE-FWD -i "$i" -o "$UNDERLAY_BR" -m conntrack --ctstate DNAT -j ACCEPT
+  iptables -t filter -A VDC-EDGE-FWD -i "$UNDERLAY_BR" -o "$i" -m conntrack --ctstate DNAT -j ACCEPT
+  if [ -n "$EDGE_HUB_SSH" ]; then
+    iptables -t nat -A VDC-EDGE -p tcp --dport "$EDGE_HUB_SSH" -j DNAT --to-destination "$HUB_IP:22"
+  fi
+  iptables -t nat -A VDC-EDGE -p tcp --dport "$JUMP_PORT" -j DNAT --to-destination "$HUB_IP:$JUMP_PORT"
+  if [ -n "$WEBCONSOLE_PORTS" ]; then   # no port in --to-destination: each keeps its own
+    iptables -t nat -A VDC-EDGE -p tcp --dport "${WEBCONSOLE_PORTS/-/:}" -j DNAT --to-destination "$HUB_IP"
+  fi
+  while read -r port addr guest; do
+    [ -n "$port" ] || continue
+    iptables -t nat -A VDC-EDGE -p tcp --dport "$port" -m comment --comment "guest $guest" \
+      -j DNAT --to-destination "$addr:22"
+    n=$((n + 1))
+  done < <(edge_guest_ports)
+  echo "$n"
 }
 
 cmd_edge() {
   [ "$HOST_ROLE" = main ] || die "the edge is the main PC (it runs the hub)"
   local i a n
   case ${1:-status} in
-    up)
+    up|sync|routes)
+      edge_routes
       i=$(edge_if || true)
       if [ -z "$i" ]; then
-        echo "edge: no campus NIC (EDGE_IF is empty and there is no default route)"
-      else
-        command -v iptables >/dev/null || die "the edge needs iptables"
-        step "edge: campus $i:$JUMP_PORT -> jump host $HUB_IP:$JUMP_PORT"
-        # the one kernel setting the edge changes: remembered, and restored by 'edge down'
-        [ -f "$ST/edge.ip_forward" ] || cat /proc/sys/net/ipv4/ip_forward >"$ST/edge.ip_forward"
-        sysctl -qw net.ipv4.ip_forward=1
-        edge_ipt nat PREROUTING -i "$i" -p tcp --dport "$JUMP_PORT" -m comment --comment vdc-edge \
-          -j DNAT --to-destination "$HUB_IP:$JUMP_PORT"
-        # from the hub's view the connection comes from this PC, so its reply returns here
-        edge_ipt nat POSTROUTING -o "$UNDERLAY_BR" -d "$HUB_IP" -p tcp --dport "$JUMP_PORT" \
-          -m comment --comment vdc-edge -j MASQUERADE
-        edge_ipt filter FORWARD -i "$i" -o "$UNDERLAY_BR" -d "$HUB_IP" -p tcp --dport "$JUMP_PORT" \
-          -m comment --comment vdc-edge -j ACCEPT
-        edge_ipt filter FORWARD -i "$UNDERLAY_BR" -o "$i" -s "$HUB_IP" -p tcp --sport "$JUMP_PORT" \
-          -m comment --comment vdc-edge -j ACCEPT
+        echo "edge: no campus NIC (EDGE_IF is empty and there is no default route)"; return 0
       fi
-      edge_routes
+      command -v iptables >/dev/null || die "the edge needs iptables"
+      if [ "$1" != up ] && ! edge_on; then
+        echo "edge: routes updated; the forwards are off (./cluster.sh edge up)"; return 0
+      fi
+      if [ "$1" = up ]; then
+        step "edge: campus $i -> hub and guests, from $EDGE_ALLOW"
+        edge_clear          # the campus address or EDGE_ALLOW may have changed
+      fi
+      # the one kernel setting the edge changes: remembered, and restored by 'edge down'
+      [ -f "$ST/edge.ip_forward" ] || cat /proc/sys/net/ipv4/ip_forward >"$ST/edge.ip_forward"
+      sysctl -qw net.ipv4.ip_forward=1
+      n=$(edge_rules "$i")
+      # only connections from EDGE_ALLOW to this PC's own address enter VDC-EDGE
       a=$(edge_addr || true)
-      n=$(ip route show proto "$EDGE_RT_PROTO" 2>/dev/null | wc -l)
-      echo "edge up: ssh -J t-<tenant>@${a:-<this PC>}:$JUMP_PORT <user>@<guest>   ($n tenant route(s) via the hub)" ;;
-    routes) edge_routes ;;
+      edge_ipt nat PREROUTING -i "$i" ${a:+-d "$a"} -s "$EDGE_ALLOW" -m comment --comment vdc-edge -j VDC-EDGE
+      # from the lab's view the connection comes from this PC (LABPC_IP), so replies return here
+      edge_ipt nat POSTROUTING -o "$UNDERLAY_BR" -m conntrack --ctstate DNAT -m comment --comment vdc-edge -j SNAT --to-source "$LABPC_IP"
+      edge_ipt filter FORWARD -m comment --comment vdc-edge -j VDC-EDGE-FWD
+      if [ "$1" = up ]; then
+        echo "edge up: ${a:-<this PC>} forwards hub SSH :${EDGE_HUB_SSH:--}, jump host :$JUMP_PORT," \
+             "consoles :$WEBCONSOLE_PORTS, $n guest SSH port(s); from $EDGE_ALLOW"
+      fi ;;
     down)
       edge_clear
       ip route flush proto "$EDGE_RT_PROTO" 2>/dev/null || true
       edge_forward_restore
-      echo "edge down: jump host forward and tenant routes removed" ;;
+      echo "edge down: forwards and tenant routes removed" ;;
     status)
       i=$(edge_if || true); a=$(edge_addr || true)
-      echo "campus NIC  ${i:-none}${a:+ ($a)}"
-      if iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- '--comment vdc-edge'; then
-        echo "jump host   ${a:-<this PC>}:$JUMP_PORT -> $HUB_IP:$JUMP_PORT"
+      echo "campus NIC  ${i:-none}${a:+ ($a)}   allowed from $EDGE_ALLOW"
+      if edge_on; then
+        [ -z "$EDGE_HUB_SSH" ] || echo "hub ssh     ssh -p $EDGE_HUB_SSH root@${a:-<this PC>}"
+        echo "jump host   ssh -J t-<tenant>@${a:-<this PC>}:$JUMP_PORT <user>@<guest>"
+        echo "consoles    ${a:-<this PC>}:$WEBCONSOLE_PORTS -> $HUB_IP (hubctl consoles)"
+        iptables -t nat -S VDC-EDGE 2>/dev/null | awk -v a="${a:-<this PC>}" '
+          /--comment "?guest / {for (k = 1; k <= NF; k++) {if ($k == "--dport") p = $(k + 1); if ($k ~ /^"?guest$/) g = $(k + 1); if ($k == "--to-destination") d = $(k + 1)}
+            gsub(/"/, "", g); printf "guest ssh   %-14s ssh -p %s <user>@%s   -> %s\n", g, p, a, d}'
       else
-        echo "jump host   not forwarded (./cluster.sh edge up)"
+        echo "forwards    off (./cluster.sh edge up)"
       fi
       echo "routes      $(ip route show proto "$EDGE_RT_PROTO" 2>/dev/null | awk '{print $1}' | tr '\n' ' ')" ;;
-    *) die "usage: $0 edge up|down|status|routes" ;;
+    *) die "usage: $0 edge up|down|status|sync" ;;
   esac
 }
 
@@ -834,6 +899,8 @@ VDC_METER_MINUTES=$CLOUD_METER_MINUTES
 VDC_SUDO=
 VDC_EDGE_HOST=$(edge_addr || true)
 VDC_JUMP_PORT=$JUMP_PORT
+VDC_EDGE=${EDGE:-yes}
+VDC_WEBCONSOLE_PORTS=$WEBCONSOLE_PORTS
 VDC_WEBCONSOLE_MINUTES=${WEBCONSOLE_MINUTES:-60}
 VDC_GUEST_PASSWORD=${GUEST_PASSWORD:-vdclab}
 VDC_QUEUE_BACKEND=$CLOUD_QUEUE
@@ -1102,7 +1169,10 @@ case ${1:-help} in
   ssh) need_root; [ -n "${2:-}" ] || die "usage: $0 ssh NAME [CMD]"
     ip=$(node_ip "$2") || die "unknown node $2"; shift 2; lab_ssh_t "$ip" "$@" ;;
   hubctl) need_root; shift; rc=0; lab_ssh_t "$HUB_IP" hubctl "$@" || rc=$?
-    case "${1:-} ${2:-}" in "tenant add"|"tenant del") edge_routes ;; esac
+    case "${1:-} ${2:-}" in "tenant add"|"tenant del"|"vm add"|"vm del") cmd_edge sync >/dev/null || true ;; esac
+    if [ "${1:-} ${2:-}" = "vm add" ] && [ "$rc" = 0 ] && edge_on; then   # the real campus address
+      cmd_edge status | awk -v g="${3:-}" '$1 == "guest" && $3 == g {sub(/^guest ssh +[^ ]+ +/, ""); print "forwarded:  " $0}'
+    fi
     exit "$rc" ;;
   image) shift; cmd_image "$@" ;;
   images) cmd_image list ;;

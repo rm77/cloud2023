@@ -44,9 +44,14 @@ def test_vm_gets_access_summary(client, hub):
     assert a["gateway"] == a["dns"] == "10.100.20.1".replace("100", str(client.get("/tenant/me", headers=H["zed"]).json()["vni"]))
     assert a["jump_user"] == "t-tenant-z" and a["jump_port"] == 45222 and a["keys"] == 1
     g = a["guests"][0]
-    assert g["name"] == "z1" and g["user"] == "cirros" and g["ssh"].startswith("ssh -J t-tenant-z@") \
-        and g["ssh"].endswith(f"cirros@{g['ip']}")
-    assert "ProxyJump t-tenant-z@" in a["ssh_config"]
+    assert g["name"] == "z1" and g["user"] == "cirros"
+    # every guest has its own SSH port on the lab PC's campus address, and the jump host still works
+    assert g["ssh_port"] >= 46000 and g["ssh"] == f"ssh -p {g['ssh_port']} cirros@<lab PC>"
+    assert g["ssh_jump"].startswith("ssh -J t-tenant-z@") and g["ssh_jump"].endswith(f"cirros@{g['ip']}")
+    assert f"Port {g['ssh_port']}" in a["ssh_config"] and "Host tenant-z-z1" in a["ssh_config"]
+    v = client.get("/tenant/vms/z1", headers=H["zed"]).json()
+    assert v["ssh_port"] == g["ssh_port"] and v["ssh"] == g["ssh"]
+    assert getattr(hub, "edge_syncs", 0) >= 1                  # the lab PC was told to forward it
 
 
 def test_web_console(client, hub, fake_ttyd):
@@ -54,6 +59,11 @@ def test_web_console(client, hub, fake_ttyd):
     assert r.status_code == 201, r.text
     url = r.json()["url"]
     sid = r.json()["id"]
+    # ttyd itself, on the campus address: same session, ttyd's own login
+    assert r.json()["direct_url"] == f"http://<lab PC>:{hub.console_port}/console/{sid}/"
+    assert r.json()["direct_login"] == "lab / " + hub.consoles[sid][2]
+    listed = client.get("/tenant/consoles", headers=H["zed"]).json()
+    assert [c["direct_url"] for c in listed if c["id"] == sid] == [r.json()["direct_url"]]
     page = client.get(url)                                   # no login: the URL is the secret
     assert page.status_code == 200 and "ttyd page of z1" in page.text
     assert client.get(url + "token").json() == {"token": "t0k"}

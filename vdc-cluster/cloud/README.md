@@ -119,9 +119,9 @@ they may use, what it costs, and what happened.
 | `GET /provider/hosts` · `/inventory` · `/health` | Monitoring & inventory | physical layer, inventory, health |
 | `GET /provider/vms` · `DELETE /{name}` | Provisioning | VMs of all tenants with their node |
 | `GET /provider/jobs` · `/{id}` | Provisioning | all jobs |
-| `GET /tenant/access` | Access | my gateway, internet, jump host, an `ssh -J` command per guest, a `~/.ssh/config` |
+| `GET /tenant/access` | Access | my gateway, internet, jump host; per guest its campus SSH port (`ssh -p 460xx user@<lab PC>`) and the `ssh -J` alternative; a `~/.ssh/config` |
 | `GET /tenant/keys` · `POST` · `DELETE /{id}` | Access | my SSH keys: jump host login, put into new guests |
-| `POST /tenant/vms/{name}/console` | Access | web console (ttyd) of my VM: open the returned URL; `{"public": true}` adds a `public_url` through a tunnel |
+| `POST /tenant/vms/{name}/console` | Access | web console (ttyd) of my VM: open the returned URL; `direct_url` + `direct_login` reach ttyd on the campus address; `{"public": true}` adds a `public_url` through a tunnel |
 | `GET /tenant/consoles` · `DELETE /{id}` | Access | my open web consoles |
 | `PATCH /provider/tenants/{name}` `{"internet": false}` | Business support | switch a tenant's internet off or on |
 | `GET /provider/tenants/{name}/access` · `/keys` | Access | the same for any tenant |

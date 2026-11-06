@@ -150,6 +150,10 @@ def job_view(s: Session, j: Job) -> dict:
 # ---------------------------------------------------------------- VM view (API record + hub facts)
 def vm_views(s: Session, records: list[Vm], with_node=False, with_state=False) -> list[VmOut]:
     hub_rows = {r["name"]: r for r in hub_call(labhub.hub_read, "vms")}
+    ports = guest_ports()
+    users = {}
+    if ports and records:
+        users = {r["name"]: r["user"] for r in hub_call(labhub.hub_read, "images")}
     states = {}
     if with_state and records:
         states = {r["guest"]: r["state"] for r in hub_call(lambda: labhub.table(labhub.hub("vms")))}
@@ -161,6 +165,7 @@ def vm_views(s: Session, records: list[Vm], with_node=False, with_state=False) -
         f = flavors.get(v.flavor)
         out.append(VmOut(name=v.name, tenant=tenants.get(v.tenant_id, "?"), flavor=v.flavor, image=v.image,
                          status=v.status, ip=h.get("ip") or None, mac=h.get("mac") or None,
+                         ssh_port=ports.get(v.name), ssh=ssh_direct(ports.get(v.name), users.get(v.image, "root")),
                          vcpus=f.vcpus if f else int(h.get("cpus") or 1),
                          mem_mb=f.mem_mb if f else int(h.get("mem") or 0),
                          node=h.get("node") if with_node else None,
@@ -169,10 +174,30 @@ def vm_views(s: Session, records: list[Vm], with_node=False, with_state=False) -
     return out
 
 
+def guest_ports() -> dict:
+    """guest -> its SSH port on the lab PC's campus address (empty when the edge is off)"""
+    if not config.EDGE:
+        return {}
+    return {r["name"]: int(r["port"]) for r in hub_call(labhub.hub_read, "ports") if r["port"].isdigit()}
+
+
+def ssh_direct(port, user) -> str | None:
+    return f"ssh -p {port} {user}@{config.EDGE_HOST or '<lab PC>'}" if port else None
+
+
+def refresh_edge():
+    """the main PC's forwards and routes (cluster.sh edge sync), after tenants or guests change"""
+    try:
+        labhub.cluster("edge", "sync", timeout=60)
+    except labhub.LabError:
+        pass
+
+
 def tenant_allocations(t: Tenant):
     rows = hub_call(hub_tenants.ips, t.name)
     return [dict(ip=r["ip"], mac=r["mac"], vm=r["guest"], next_free=r["next_free"]) for r in rows]
 
 
 __all__ = ["hub_call", "audit", "quota_of", "usage_of", "check_quota", "pick_network", "gateway_of",
-           "enqueue", "job_view", "vm_views", "tenant_allocations", "hub_vms"]
+           "enqueue", "job_view", "vm_views", "tenant_allocations", "hub_vms", "guest_ports", "ssh_direct",
+           "refresh_edge"]

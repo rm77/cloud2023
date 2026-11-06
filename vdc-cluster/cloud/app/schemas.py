@@ -89,7 +89,9 @@ class GuestAccess(BaseModel):
     name: str
     ip: Optional[str] = None
     user: str
-    ssh: str
+    ssh_port: Optional[int] = None    # on the lab PC's campus address
+    ssh: str                          # the simplest way in: the campus port, else the jump host
+    ssh_jump: str = ""
     console: str
 
 
@@ -116,6 +118,8 @@ class ConsoleOut(BaseModel):
     vm: str
     url: str
     public_url: Optional[str] = None
+    direct_url: Optional[str] = None   # ttyd itself, on the lab PC's campus address
+    direct_login: Optional[str] = None # ttyd's own login for direct_url: "lab / <password>"
     expires: datetime
     note: str = "open the url in a browser; it works once, until it expires"
 
@@ -200,6 +204,8 @@ class VmOut(BaseModel):
     status: str                       # creating | active | error | deleting
     ip: Optional[str] = None
     mac: Optional[str] = None
+    ssh_port: Optional[int] = None    # ssh -p PORT user@<lab PC>
+    ssh: Optional[str] = None
     vcpus: int
     mem_mb: int
     node: Optional[str] = None        # provider and auditor only

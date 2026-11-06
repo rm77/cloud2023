@@ -203,8 +203,7 @@ def consoles(c: Caller = Depends(consumer), s: Session = Depends(get_session)):
     access.expire_consoles(s)
     rows = s.exec(select(ConsoleSession).where(ConsoleSession.tenant_id == c.tenant.id,
                                                ConsoleSession.closed == False))  # noqa: E712
-    return [ConsoleOut(id=r.id, vm=r.vm, url=f"/console/{r.id}/", public_url=access.console_public_url(s, r.id),
-                       expires=r.expires) for r in rows]
+    return [access.console_out(s, r) for r in rows]
 
 
 @router.delete("/consoles/{sid}", status_code=204, tags=[ACC], summary="Close one of my web consoles")

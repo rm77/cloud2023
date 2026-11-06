@@ -5,6 +5,7 @@ from sqlmodel import Session
 from .db import Flavor, Vm, engine
 from .infra import cluster as hub_cluster, images as hub_images, vms as hub_vms
 from .infra.labhub import LabError
+from .services import refresh_edge
 
 
 def create_vm(name, tenant, flavor, image, ip=None):
@@ -24,6 +25,7 @@ def create_vm(name, tenant, flavor, image, ip=None):
         finally:
             if rec:
                 s.add(rec); s.commit()
+            refresh_edge()                 # the guest's campus SSH port, forwarded by the lab PC
 
 
 def delete_vm(name):
@@ -38,6 +40,7 @@ def delete_vm(name):
                 raise
         if rec:
             s.delete(rec); s.commit()
+        refresh_edge()
         return dict(deleted=name)
 
 
