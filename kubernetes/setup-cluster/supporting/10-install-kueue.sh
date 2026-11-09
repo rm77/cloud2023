@@ -137,7 +137,7 @@ fi
 # (kube-prometheus naming). kube-prometheus-stack uses a different account,
 # so the ServiceMonitor and RBAC are created by this script instead.
 cat > "$WORK_DIR/kueue-values.yaml" <<EOF
-enablePrometheus: false
+enablePrometheus: true
 enableKueueViz: ${KUEUE_ENABLE_VIZ}
 
 metricsService:
