@@ -64,12 +64,13 @@ sh prepare/register-metrics.sh
 ```
 
 It checks Metrics Server and Prometheus, then installs Prometheus Adapter if no Helm-managed adapter exists, or merges this module's rules into the selected Helm release. If there is more than one Adapter release, provide its Helm release and namespace:
+<!--
 
 ```sh
 sh prepare/register-metrics.sh <adapter-release> <namespace>
 ```
-
 The script needs `kubectl`, Helm, and `jq`. The JSON file `prepare/prometheus-adapter-values.json` is Helm configuration, not a Kubernetes manifest, so do not pass it to `kubectl apply`.
+-->
 
 ## 2. Configure the module
 
