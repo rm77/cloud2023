@@ -22,6 +22,25 @@ The directory and scripts follow the configuration, `k8s/`, and `scripts/` patte
 - Prometheus Operator/kube-prometheus-stack and Prometheus Adapter
 - Helm and `jq` for the one-time Adapter registration step
 
+
+
+The shared cluster setup is documented in [`kubernetes/setup-cluster/supporting`](https://github.com/rm77/cloud2023/tree/master/kubernetes/setup-cluster/supporting). This module expects the Prometheus Service `monitoring-kube-prometheus-prometheus` in namespace `monitoring`, with the ServiceMonitor label `release: monitoring` selected by Prometheus.
+
+To simplify run from within `kubernetes/setup-cluster/supporting`
+
+```
+cd kubernetes/setup-cluster/supporting
+
+sh 02-install-metrics-server.sh  
+sh 03-install-ingress.sh         
+sh 04-cek-ingress.sh         
+sh 05-install-prometheus.sh  
+sh 06-install-linkerd.sh    
+sh 07-install-netobserv.sh  
+ 
+```
+
+
 Make sure Metrics Server is installed and check it with:
 
 ```sh
@@ -35,8 +54,6 @@ kubectl get svc -n monitoring
 kubectl get endpointslice -n monitoring \
   -l kubernetes.io/service-name=monitoring-kube-prometheus-prometheus
 ```
-
-The shared cluster setup is documented in [`kubernetes/setup-cluster/supporting`](https://github.com/rm77/cloud2023/tree/master/kubernetes/setup-cluster/supporting). This module expects the Prometheus Service `monitoring-kube-prometheus-prometheus` in namespace `monitoring`, with the ServiceMonitor label `release: monitoring` selected by Prometheus.
 
 ## 1. Prepare custom metrics once per cluster
 
@@ -57,10 +74,11 @@ The script needs `kubectl`, Helm, and `jq`. The JSON file `prepare/prometheus-ad
 ## 2. Configure the module
 
 Defaults are in `config/environment.env`:
+provided is `config/environment.env.original`, you should copy to `config/environment.env` first
 
 ```sh
 HOST_IP=127.0.0.1
-CLUSTER_NAME=kind
+CLUSTER_NAME=mylab99
 NAMESPACE=hpa-multi-metric
 INGRESS_HTTP_PORT=80
 ```
