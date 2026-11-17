@@ -16,15 +16,13 @@ The included HPA lists all four signals. Kubernetes calculates a replica recomme
 
 The queue is intentionally an in-memory, per-pod demonstration. It is useful for learning how queue-depth metrics can drive an HPA, but it is not a durable production queue: restarting or removing a pod can discard its pending jobs. For a real shared queue such as RabbitMQ or Kafka, expose queue backlog as an external metric through an appropriate adapter or KEDA.
 
-## Requirements
+## Prerequisites
 
-- Kubernetes cluster and `kubectl`
-- Docker and `kind` for the example image workflow (or another way to build/publish the image)
-- Prometheus Operator stack (for example `kube-prometheus-stack`), Prometheus Adapter, and Helm
+The cluster infrastructure and shared monitoring requirements for this example are provided by the project setup under `kubernetes/setup-cluster/supporting`. Complete that setup for the cluster you intend to use before running this example. This guide assumes the cluster, Metrics Server, Prometheus monitoring stack, Prometheus Adapter, and Helm are already available; it does not install those shared components again.
 
-Metrics Server supplies the CPU and memory resource metrics; it does not supply the two application metrics. Resource metric support is limited to CPU and memory, while application signals use a custom metrics API. See the [Kubernetes resource metrics pipeline documentation](https://kubernetes.io/docs/tasks/debug/debug-cluster/resource-metrics-pipeline/).
+Metrics Server supplies CPU and memory resource metrics. The Prometheus Adapter supplies the application-specific custom metrics used below. See the [Kubernetes resource metrics pipeline documentation](https://kubernetes.io/docs/tasks/debug/debug-cluster/resource-metrics-pipeline/) for the distinction between these APIs.
 
-The Prometheus Adapter values assume Prometheus is reachable at `http://kube-prometheus-stack-prometheus.monitoring.svc:9090` and discovers `ServiceMonitor` resources labeled `release: kube-prometheus-stack` in `default`. Adjust those for your installation.
+The adapter values in this example assume Prometheus is reachable at `http://kube-prometheus-stack-prometheus.monitoring.svc:9090` and that the Prometheus Operator discovers `ServiceMonitor` resources labeled `release: kube-prometheus-stack` in `default`. Align these values with the services and selectors established by `kubernetes/setup-cluster/supporting`.
 
 ## 1. Check Metrics Server
 
@@ -54,19 +52,11 @@ The app exports:
 
 It also has `/cpu`, `/memory`, and `/slow` endpoints to generate CPU activity, temporary memory pressure, and concurrent requests. The `/queue?count=N` endpoint enqueues demo jobs.
 
-## 3. Configure Prometheus Adapter
+## 3. Add this workload's rules to the existing Prometheus Adapter
 
-Install the adapter with the custom metric rules:
+The Prometheus Adapter is already part of the supporting setup. Add the two custom rules in `k8s/prometheus-adapter-values.yaml` to that existing adapter configuration; do not install a second adapter release. Preserve the adapter's existing values and merge these rules into its custom rules list. If the adapter is managed by Helm, use the release name and namespace established by the supporting setup when applying the merged values.
 
-```sh
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm repo update
-helm upgrade --install prometheus-adapter prometheus-community/prometheus-adapter \
-  --namespace monitoring --create-namespace \
-  --values k8s/prometheus-adapter-values.yaml
-```
-
-Verify the API and metrics are available after Prometheus scrapes the app:
+After updating the existing adapter configuration and allowing Prometheus to scrape the app, verify the custom metrics API and values:
 
 ```sh
 kubectl get apiservice v1beta1.custom.metrics.k8s.io

@@ -3,7 +3,6 @@ prometheus:
   port: 9090
 
 rules:
-  default: false
   custom:
     - seriesQuery: 'demo_inflight_requests{namespace!="",pod!=""}'
       resources:
