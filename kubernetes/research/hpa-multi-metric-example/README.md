@@ -100,16 +100,43 @@ For the example remote IP and port above, it is:
 http://hpa-multi-metric-demo.10.28.84.254.sslip.io:28080/
 ```
 
-Smoke-test the external path and watch scaling:
+Smoke-test the external path:
 
 ```sh
 ./scripts/smoke-test.sh
-kubectl get hpa,pods -n hpa-multi-metric -w
 ```
 
 If you changed `NAMESPACE`, use that namespace in kubectl commands. These scripts render namespace and hostname placeholders with POSIX `sed`; the manifests do not need hand edits or `yq`.
 
-## 4. Verify the metrics
+## 4. Watch how the HPA reacts to load
+
+After deployment, open two terminals to watch the HPA and its pods. Run these before starting a load generator:
+
+**Terminal 1 — HPA metrics and replica count**
+
+```sh
+kubectl get hpa hpa-multi-metric-demo -n hpa-multi-metric --watch
+```
+
+**Terminal 2 — pod creation and readiness**
+
+```sh
+kubectl get pods -n hpa-multi-metric --watch
+```
+
+In the HPA output, `TARGETS` shows the current metric value alongside its target (for example, `cpu: 95%/70%`, `inflight_requests: 12/4`, or `queue_depth: 25/10`). A value above its target asks the HPA to add replicas. `REPLICAS` shows the replica count reported for the target Deployment; the pod watch shows when new pods are created and become ready.
+
+Start one of the load generators in a third terminal (examples below). Watch the current metric values rise and the HPA replica count change. The HPA considers all available metrics and uses the largest replica recommendation, up to 12. After stopping the load, scale-down is intentionally delayed by the 120-second stabilization window.
+
+At startup, custom metrics can temporarily appear as `<unknown>` while Prometheus scrapes the app and the Adapter retrieves the series. If they remain unknown, use the verification commands below and inspect the HPA events with `kubectl describe`.
+
+To see the HPA's computed desired replicas and scaling events in more detail:
+
+```sh
+kubectl describe hpa hpa-multi-metric-demo -n hpa-multi-metric
+```
+
+## 5. Verify the metrics
 
 Wait for Prometheus to scrape the app, then inspect APIService and custom metric values:
 
@@ -122,7 +149,7 @@ kubectl describe hpa hpa-multi-metric-demo -n hpa-multi-metric
 
 The app exports `demo_inflight_requests` and `demo_queue_depth`. It also provides `/cpu`, `/memory`, `/slow`, and `/queue` endpoints to create load.
 
-## 5. Generate load
+## 6. Generate load
 
 Run load generators from a second terminal. These use the in-cluster Service, so they work independently of the external Ingress hostname.
 
@@ -154,7 +181,7 @@ kubectl run memory-load -n hpa-multi-metric --rm -it --restart=Never --image=cur
   curl -s "http://hpa-multi-metric-demo.hpa-multi-metric.svc.cluster.local/memory?mb=64&seconds=20"
 ```
 
-Stop generators with Ctrl-C and observe the HPA events. The HPA uses the highest recommendation across available metrics; `maxReplicas` caps scaling at 12.
+Stop generators with Ctrl-C. Keep the HPA and pod watches open to see the metrics fall and the replica count scale down after the stabilization window. `maxReplicas` caps scaling at 12.
 
 ## Remove the module
 
