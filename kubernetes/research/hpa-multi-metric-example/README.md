@@ -18,11 +18,13 @@ The queue is intentionally an in-memory, per-pod demonstration. It is useful for
 
 ## Prerequisites
 
-The cluster infrastructure and shared monitoring requirements for this example are provided by the project setup under `kubernetes/setup-cluster/supporting`. Complete that setup for the cluster you intend to use before running this example. This guide assumes the cluster, Metrics Server, Prometheus monitoring stack, Prometheus Adapter, and Helm are already available; it does not install those shared components again.
+The cluster infrastructure and shared monitoring stack are provided by the project setup under [`kubernetes/setup-cluster/supporting`](https://github.com/rm77/cloud2023/tree/master/kubernetes/setup-cluster/supporting). Its [`02-install-metrics-server.sh`](https://github.com/rm77/cloud2023/blob/master/kubernetes/setup-cluster/supporting/02-install-metrics-server.sh) installs Metrics Server and configures `--kubelet-insecure-tls`; [`05-install-prometheus.sh`](https://github.com/rm77/cloud2023/blob/master/kubernetes/setup-cluster/supporting/05-install-prometheus.sh) installs `kube-prometheus-stack` in namespace `monitoring` with Helm release `monitoring`. Complete the shared setup before running this example.
+
+Make sure the existing Prometheus Adapter is available and configured to serve custom metrics. The two supporting scripts above do not install the Adapter. The included `k8s/prometheus-adapter-values.yaml` provides the rules for this workload; merge them into the existing Adapter's configuration rather than installing a second Adapter release.
 
 Metrics Server supplies CPU and memory resource metrics. The Prometheus Adapter supplies the application-specific custom metrics used below. See the [Kubernetes resource metrics pipeline documentation](https://kubernetes.io/docs/tasks/debug/debug-cluster/resource-metrics-pipeline/) for the distinction between these APIs.
 
-The adapter values in this example assume Prometheus is reachable at `http://kube-prometheus-stack-prometheus.monitoring.svc:9090` and that the Prometheus Operator discovers `ServiceMonitor` resources labeled `release: kube-prometheus-stack` in `default`. Align these values with the services and selectors established by `kubernetes/setup-cluster/supporting`.
+The provided Kubernetes files already match the supporting setup: the Adapter values point to `monitoring-kube-prometheus-prometheus` in namespace `monitoring`, and the workload's `ServiceMonitor` uses label `release: monitoring`. Confirm the Prometheus service name with `kubectl get svc -n monitoring` if your installation differs.
 
 ## 1. Check Metrics Server
 
@@ -54,7 +56,7 @@ It also has `/cpu`, `/memory`, and `/slow` endpoints to generate CPU activity, t
 
 ## 3. Add this workload's rules to the existing Prometheus Adapter
 
-The Prometheus Adapter is already part of the supporting setup. Add the two custom rules in `k8s/prometheus-adapter-values.yaml` to that existing adapter configuration; do not install a second adapter release. Preserve the adapter's existing values and merge these rules into its custom rules list. If the adapter is managed by Helm, use the release name and namespace established by the supporting setup when applying the merged values.
+Add the two custom rules in `k8s/prometheus-adapter-values.yaml` to the existing Adapter configuration; do not install a second Adapter release. Preserve the Adapter's existing values and merge these rules into its custom rules list. The file already contains the Prometheus service address used by the supporting setup. If the Adapter is managed by Helm, apply the merged values to its existing release and namespace.
 
 After updating the existing adapter configuration and allowing Prometheus to scrape the app, verify the custom metrics API and values:
 

@@ -59,7 +59,7 @@ metadata:
   name: hpa-multi-metric-demo
   namespace: default
   labels:
-    release: kube-prometheus-stack
+    release: monitoring
 spec:
   namespaceSelector:
     matchNames:
