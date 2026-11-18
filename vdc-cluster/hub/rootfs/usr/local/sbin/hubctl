@@ -165,6 +165,33 @@ mask_of() {   # 24 -> 255.255.255.0
   _m=$(( (0xffffffff << (32 - $1)) & 0xffffffff ))
   echo "$((_m >> 24 & 255)).$((_m >> 16 & 255)).$((_m >> 8 & 255)).$((_m & 255))"
 }
+# dnsmasq keeps a lease for 12 h and won't give that address to anyone else meanwhile - so a
+# guest recreated with the same address (and a new MAC) would get nothing. Drop every guest lease
+# (MAC 52:54:01:...) that isn't the reservation of an existing guest.
+lease_files() {
+  ps -o args 2>/dev/null | sed -n 's/.*--dhcp-leasefile=\([^ ]*\).*/\1/p'
+  sed -n 's/^dhcp-leasefile=//p' /etc/dnsmasq.conf 2>/dev/null
+  ls /var/lib/misc/*.leases /var/lib/dnsmasq/*.leases 2>/dev/null
+}
+guest_leases_prune() {
+  _stale=""
+  for _lf in $(lease_files | sort -u); do
+    [ -s "$_lf" ] || continue
+    awk 'NR == FNR {split($0, a, ","); ok[a[1] " " a[2]] = 1; next}
+         $2 ~ /^52:54:01:/ && !(($2 " " $3) in ok) {f = 1} END {exit !f}' "$DHCP_GUESTS" "$_lf" &&
+      _stale="$_stale $_lf"
+  done
+  [ -n "$_stale" ] || return 0
+  # dnsmasq rewrites the file from memory: stop it, edit, start
+  rc-service dnsmasq stop >/dev/null 2>&1 || true
+  for _lf in $_stale; do
+    awk 'NR == FNR {split($0, a, ","); ok[a[1] " " a[2]] = 1; next}
+         !($2 ~ /^52:54:01:/ && !(($2 " " $3) in ok))' "$DHCP_GUESTS" "$_lf" >"$_lf.tmp" && mv "$_lf.tmp" "$_lf"
+  done
+  rc-service dnsmasq start >/dev/null 2>&1 || true
+  step "stale guest DHCP leases released"
+}
+
 guest_dhcp() {
   awk '$7 ~ /:/ && $5 ~ /^[0-9.]+$/ {print $7 "," $5 "," $1}' "$VMS" >"$DHCP_GUESTS.tmp"
   mv "$DHCP_GUESTS.tmp" "$DHCP_GUESTS"; chmod 644 "$DHCP_GUESTS"
@@ -181,6 +208,7 @@ guest_dhcp() {
       echo "dhcp-option=tag:t$_v,option:domain-search,lab"
     done <"$TENANTS"
   } >"$DHCP_CONF.tmp"
+  guest_leases_prune
   if cmp -s "$DHCP_CONF.tmp" "$DHCP_CONF"; then
     rm -f "$DHCP_CONF.tmp"
     killall -HUP dnsmasq 2>/dev/null || true       # rereads the guests' leases

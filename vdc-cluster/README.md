@@ -760,6 +760,7 @@ guest from there: what stops you?
 | `ssh -p 460xx` asks for a password, or says Permission denied | the tenant's key was added after the guest was created: recreate it, or put the key in by hand on the console |
 | `ssh -p 460xx` warns the host key changed | the port belonged to a deleted guest before: `ssh-keygen -R "[<campus address>]:460xx"` |
 | an Alpine guest's eth0 is down | it was created with the address in its seed, which Alpine's cloud-init can't apply: `update`, then recreate the guest |
+| a recreated guest gets 169.254.x.x, and the hub's dnsmasq log says `not using configured address … because it is leased to` another MAC | the deleted guest's lease was still valid; `vm add`, `vm del` and `update hub` now release it (restart the guest's network afterwards) |
 | a guest has a 169.254.x.x address | it found no DHCP answer: the hub hands out each guest's IPAM address by DHCP (`/etc/dnsmasq.d/lab-tenants.conf`); `sudo ./cluster.sh update hub`, then restart the guest |
 | web console refused on the campus address | open `http://<campus address>:<port>/console/<SID>/`, not just the port; `edge status` should list the console range |
 | web console URL answers 404 | it was used once already, or expired: open a new one |
