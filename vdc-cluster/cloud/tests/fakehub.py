@@ -110,6 +110,11 @@ class FakeHub:
             if a[2] not in self.vms:
                 raise labhub.LabError(f"no guest {a[2]}")
             del self.vms[a[2]]; return ""
+        if a[:2] in (["vm", "start"], ["vm", "stop"], ["vm", "reboot"]):
+            if a[2] not in self.vms:
+                raise labhub.LabError(f"no guest {a[2]}")
+            self.vms[a[2]]["state"] = "shut off" if a[1] == "stop" else "running"
+            return f"{a[2]} {a[1]}: done\n"
         if a[:2] == ["vm", "info"]:
             return f"guest    {a[2]}\nlogin    cirros / vdclab   (hubctl vm console {a[2]})\n"
         if a == ["vms"]:

@@ -25,6 +25,7 @@ LOCK=/run/lab-agent.lock
 LAST=/run/lab-agent.last            # last noted message (dedupe)
 ONCE=/run/lab-agent.once            # .<key>: once-per-boot progress messages
 READY=/run/lab-agent.ready          # first successful sync since boot
+AUTOSTARTED=${READY}.autostart   # guests started once since boot
 RETRY=2                             # seconds between attempts until ready
 
 node_get() { if [ -r "$NODE_ENV" ]; then kv "$1" <"$NODE_ENV"; fi; }
@@ -169,6 +170,11 @@ sync_once() {
   apply_links "$hub"             # 1. new bridges/tunnels
   sync_tenant_nets "$CACHE"      # 2. libvirt networks on top of them
   prune_links                    # 3. only then drop what is gone
+  # first sync since boot with libvirtd up: bring back the guests that should run
+  if [ ! -e "$AUTOSTARTED" ] && libvirt_ready; then
+    autostart_guests "$resp"
+    : >"$AUTOSTARTED"
+  fi
   if [ ! -e "$READY" ]; then
     : >"$READY"
     msg="ready as $name ($(node_get NODE_IP)), $(wc -l <"$CACHE" | tr -d ' ') tenant(s)"
@@ -176,8 +182,20 @@ sync_once() {
   fi
 }
 
+# The hub lists this node's guests as "GUEST <name> on|off"; "off" were stopped on purpose
+# (hubctl vm stop). After a reboot, start the others: autostart, decided by the hub.
+autostart_guests() {   # STATE-RESPONSE
+  libvirt_ready || return 0
+  printf '%s\n' "$1" | awk '$1 == "GUEST" && $3 == "on" {print $2}' | while read -r g; do
+    is_tname "$g" || continue
+    [ "$(virsh domstate "$g" 2>/dev/null | head -n 1)" = "shut off" ] || continue
+    step "guest $g: autostart"
+    if virsh -q start "$g" >/dev/null 2>&1; then log "autostart: $g"; else log "autostart of $g failed"; fi
+  done
+}
+
 cmd_boot() {
-  rm -f "$ONCE".* "$READY" "$LAST"
+  rm -f "$ONCE".* "$READY" "$LAST" "$AUTOSTARTED"
   [ ! -x "$LAB_TRACE" ] || "$LAB_TRACE" --install "$TRACE_BIN" >/dev/null 2>&1 || true
   step "Geneve kernel module"
   modprobe geneve 2>/dev/null || true

@@ -135,6 +135,18 @@ def enqueue(s: Session, caller, kind, target, func, tenant_id=None, **kwargs) ->
     return j
 
 
+def power_job(s: Session, caller, v, action: str, jobs_url: str, tenant_name: str = ""):
+    """queue start | stop | reboot of VM record V (ownership already checked by the caller)"""
+    from . import tasks
+    from .schemas import Accepted
+    if v.status != "active":
+        raise HTTPException(409, f"{v.name} is {v.status}: power actions need an active VM")
+    j = enqueue(s, caller, f"vm.{action}", v.name, tasks.power_vm, tenant_id=v.tenant_id, name=v.name, action=action)
+    kw = {"tenant": tenant_name} if tenant_name else {}
+    audit(s, caller, f"vm.{action}", v.name, "accepted", f"job {j.id}", **kw)
+    return Accepted(job=j.id, status_url=f"{jobs_url}/{j.id}")
+
+
 def job_view(s: Session, j: Job) -> dict:
     import json
     t = s.get(Tenant, j.tenant_id) if j.tenant_id else None
@@ -200,4 +212,4 @@ def tenant_allocations(t: Tenant):
 
 __all__ = ["hub_call", "audit", "quota_of", "usage_of", "check_quota", "pick_network", "gateway_of",
            "enqueue", "job_view", "vm_views", "tenant_allocations", "hub_vms", "guest_ports", "ssh_direct",
-           "refresh_edge"]
+           "refresh_edge", "power_job"]

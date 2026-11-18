@@ -14,5 +14,11 @@ start() {
   mkdir -p /var/log/lab
   export LAB_TRACE_CTX="lab-hub (boot)"
   { /usr/local/sbin/hubctl init && /usr/local/sbin/hubctl apply; } >>/var/log/lab/hub.log 2>&1
-  eend $?
+  rc=$?
+  # guests on the hub itself: libvirtd starts after us, so wait for it in the background
+  ( i=0
+    while [ $i -lt 120 ] && ! virsh -q list >/dev/null 2>&1; do sleep 2; i=$((i + 2)); done
+    /usr/local/sbin/hubctl libvirt-sync >/dev/null 2>&1
+    /usr/local/sbin/hubctl autostart hub ) >>/var/log/lab/hub.log 2>&1 &
+  eend $rc
 }

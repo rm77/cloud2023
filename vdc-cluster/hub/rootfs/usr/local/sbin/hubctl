@@ -33,6 +33,8 @@
 #   hubctl vm del NAME
 #   hubctl vm info NAME                  image, address, MAC, node, login, SSH port
 #   hubctl vm console NAME               (Ctrl-] to leave)
+#   hubctl vm start|stop|reboot NAME     power; a guest stopped here stays off after its node
+#                                        restarts, every other guest is started again (autostart)
 #   hubctl vms
 #   hubctl ports                         campus SSH port of every guest (VM_SSH_PORTS), forwarded
 #                                        by the main PC: ssh -p PORT user@<lab PC>
@@ -40,7 +42,7 @@
 #   hubctl exec NODE CMD...              run a command on a node (hub or spoke)
 #   hubctl apply                         rebuild the hub side of the overlay
 #
-# Internal: init (boot), libvirt-sync, _api join|state|leave REMOTE_IP (CGI, via doas)
+# Internal: init (boot), libvirt-sync, autostart (boot), _api join|state|leave REMOTE_IP (CGI, via doas)
 set -eu
 umask 077
 . /usr/local/lib/lab/lib.sh
@@ -52,6 +54,7 @@ CONSOLES=/run/lab/console # SID: "PORT PID GUEST" of a running web console
 FIREWALL=/etc/nftables.nft
 VMS=$S/vms                # GUEST TENANT NODE IMAGE IP MEM MAC CPUS
 PORTS=$S/ports            # GUEST PORT: the guest's SSH on the main PC's campus address
+POWER=$S/power            # GUEST off: stopped on purpose (hubctl vm stop); every other guest should run
 VM_SSH_PORTS=${VM_SSH_PORTS-46000-46999}   # empty = no per-guest SSH ports
 IMAGES=$S/images          # NAME TYPE MEM DISK USER SHA256 SIZE_MB
 IMGDIR=$S/www/images      # served to the nodes as http://hub:API_PORT/images/NAME.qcow2
@@ -408,6 +411,9 @@ api_state() {
   if is_num "$mem" && is_num "$cpus"; then echo "$mem $cpus" >"$CAPS/$n"; fi
   echo OK
   awk 'NF>=2 {print "TENANT", $1, $2}' "$TENANTS"
+  # the node's guests and whether each should run: its agent starts them after a reboot
+  [ -e "$POWER" ] || : >"$POWER"
+  awk -v n="$n" 'NR == FNR {off[$1] = 1; next} $3 == n {print "GUEST", $1, ($1 in off ? "off" : "on")}' "$POWER" "$VMS"
 }
 
 api_leave() {
@@ -862,6 +868,66 @@ cmd_console() {
   esac
 }
 
+# power: the node does it with virsh; the hub remembers who should stay off (POWER)
+power_set() {   # GUEST on|off
+  lock
+  [ -e "$POWER" ] || : >"$POWER"
+  del_line "$POWER" "$1"
+  [ "$2" = on ] || echo "$1 off" >>"$POWER"
+  flock -u 9
+}
+vm_state() { run_on "$1" "virsh domstate $2" 2>/dev/null | head -n 1; }
+vm_power() {   # start|stop|reboot GUEST NODE
+  st=$(vm_state "$3" "$2") || st=""
+  [ -n "$st" ] || die "$3 is unreachable, or has no guest $2"
+  case $1 in
+    start)
+      power_set "$2" on
+      if [ "$st" = running ]; then echo "$2 is already running on $3"; return 0; fi
+      run_on "$3" "virsh -q start $2" >/dev/null || die "starting $2 on $3 failed"
+      logf "vm start: $2 on $3"
+      echo "$2 started on $3" ;;
+    stop)
+      power_set "$2" off
+      if [ "$st" != running ]; then echo "$2 is already $st on $3"; return 0; fi
+      # ACPI power button first, like a real server; pull the plug if the OS ignores it
+      run_on "$3" "virsh -q shutdown $2" >/dev/null 2>&1 || true
+      i=0
+      while [ $i -lt "${GUEST_STOP_WAIT:-60}" ] && [ "$(vm_state "$3" "$2")" = running ]; do sleep 2; i=$((i + 2)); done
+      if [ "$(vm_state "$3" "$2")" = running ]; then
+        run_on "$3" "virsh -q destroy $2" >/dev/null 2>&1 || true
+        how="forced off after ${GUEST_STOP_WAIT:-60}s"
+      else
+        how="shut down"
+      fi
+      logf "vm stop: $2 on $3 ($how)"
+      echo "$2 $how on $3" ;;
+    reboot)
+      power_set "$2" on
+      if [ "$st" != running ]; then
+        run_on "$3" "virsh -q start $2" >/dev/null || die "starting $2 on $3 failed"
+        logf "vm reboot: $2 on $3 (was $st: started)"
+        echo "$2 was $st: started on $3"; return 0
+      fi
+      run_on "$3" "virsh -q reboot $2" >/dev/null 2>&1 || run_on "$3" "virsh -q reset $2" >/dev/null ||
+        die "rebooting $2 on $3 failed"
+      logf "vm reboot: $2 on $3"
+      echo "$2 rebooting on $3" ;;
+  esac
+}
+
+# after a node restarts: start every guest on NODE that should run (not stopped with vm stop)
+cmd_autostart() {
+  n=${1:-hub}
+  [ -e "$POWER" ] || : >"$POWER"
+  awk -v n="$n" 'NR == FNR {off[$1] = 1; next} $3 == n && !($1 in off) {print $1}' "$POWER" "$VMS" |
+    while read -r g; do
+      [ "$(vm_state "$n" "$g")" = "shut off" ] || continue
+      if run_on "$n" "virsh -q start $g" >/dev/null 2>&1; then logf "autostart: $g on $n"
+      else echo "warning: autostart of $g on $n failed" >&2; fi
+    done
+}
+
 cmd_vm() {
   case ${1:-} in
     add) shift; cmd_vm_add "$@" ;;
@@ -872,6 +938,7 @@ cmd_vm() {
       run_on "$node" "lab-guest del $2" || echo "warning: $node unreachable, removing from registry" >&2
       lock
       del_line "$VMS" "$2"
+      [ ! -e "$POWER" ] || del_line "$POWER" "$2"
       ports_sync
       guest_dhcp
       logf "vm del: $2 (address and SSH port released)" ;;
@@ -892,6 +959,11 @@ cmd_vm() {
         [ -z "$p" ] || echo "ssh      ssh -p $p $(field "$IMAGES" "${i:-cirros}" 5)@<lab PC>   (campus port $p)"
         echo "jump     ssh -J t-$t@<lab PC>:${JUMP_PORT:-45222} $(field "$IMAGES" "${i:-cirros}" 5)@$a"
       done ;;
+    start|stop|reboot)
+      [ $# -eq 2 ] || die "usage: hubctl vm $1 NAME"
+      node=$(field "$VMS" "$2" 3)
+      [ -n "$node" ] || die "no guest $2"
+      vm_power "$1" "$2" "$node" ;;
     console)
       [ $# -eq 2 ] || die "usage: hubctl vm console NAME"
       node=$(field "$VMS" "$2" 3)
@@ -934,6 +1006,7 @@ case ${1:-help} in
   init) cmd_init ;;
   libvirt-sync) sync_tenant_nets "$TENANTS" ;;
   _api) shift; api "$@" ;;
+  autostart) shift; cmd_autostart "$@" ;;
   help|-h|--help) usage ;;
   *) usage; exit 1 ;;
 esac

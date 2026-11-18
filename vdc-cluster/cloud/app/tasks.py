@@ -44,6 +44,10 @@ def delete_vm(name):
         return dict(deleted=name)
 
 
+def power_vm(name, action):
+    return dict(vm=name, action=action, result=hub_vms.power(name=name, action=action))
+
+
 def add_image(**kw):
     return hub_images.add(**kw)
 
@@ -53,7 +57,7 @@ def add_spokes(count):
 
 
 
-TASKS = {f.__name__: f for f in (create_vm, delete_vm, add_image, add_spokes)}
+TASKS = {f.__name__: f for f in (create_vm, delete_vm, power_vm, add_image, add_spokes)}
 
 
 def name_of(func) -> str:

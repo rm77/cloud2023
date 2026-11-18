@@ -13,7 +13,7 @@ from ..db import Flavor, Job, User, Vm, get_session
 from ..infra import images as hub_images, labhub
 from ..schemas import (Accepted, FlavorModel, ImageOut, JobOut, NetworkOut, TenantOut, UsageReport, UserIn,
                        UserOut, VmIn, VmOut)
-from ..services import (audit, check_quota, enqueue, gateway_of, hub_call, job_view, quota_of,
+from ..services import (power_job, audit, check_quota, enqueue, gateway_of, hub_call, job_view, quota_of,
                         tenant_allocations, usage_of, vm_views)
 from .. import tasks
 from .. import access
@@ -151,6 +151,24 @@ def delete_vm(v: Vm = Depends(my_vm), c: Caller = Depends(consumer), s: Session 
     j = enqueue(s, c, "vm.delete", v.name, tasks.delete_vm, tenant_id=c.tenant.id, name=v.name)
     audit(s, c, "vm.delete", v.name, "accepted", f"job {j.id}")
     return Accepted(job=j.id, status_url=f"/tenant/jobs/{j.id}")
+
+
+# ---- power: start, stop (ACPI, then forced after a minute), reboot. A VM stopped here stays off
+# when its node restarts; every other VM is started again.
+@router.post("/vms/{name}/start", response_model=Accepted, status_code=202, tags=[PROV], summary="Start one of my VMs")
+def start_vm(v: Vm = Depends(my_vm), c: Caller = Depends(consumer), s: Session = Depends(get_session)):
+    return power_job(s, c, v, "start", "/tenant/jobs")
+
+
+@router.post("/vms/{name}/stop", response_model=Accepted, status_code=202, tags=[PROV],
+             summary="Stop one of my VMs (shut down; it stays off until started)")
+def stop_vm(v: Vm = Depends(my_vm), c: Caller = Depends(consumer), s: Session = Depends(get_session)):
+    return power_job(s, c, v, "stop", "/tenant/jobs")
+
+
+@router.post("/vms/{name}/reboot", response_model=Accepted, status_code=202, tags=[PROV], summary="Reboot one of my VMs")
+def reboot_vm(v: Vm = Depends(my_vm), c: Caller = Depends(consumer), s: Session = Depends(get_session)):
+    return power_job(s, c, v, "reboot", "/tenant/jobs")
 
 
 @router.get("/jobs", response_model=list[JobOut], tags=[PROV], summary="My jobs, newest first")

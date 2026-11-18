@@ -66,3 +66,16 @@ def _vm(r, state=None):
     if state is not None:
         vm["state"] = state
     return vm
+
+
+POWER_ACTIONS = ("start", "stop", "reboot")
+
+
+@expose("vms.power")
+def power(name, action, **kw):
+    """start | stop | reboot one guest; the hub finds its node. A stopped guest stays off when its
+    node restarts; the others are started again."""
+    check("name", name)
+    if action not in POWER_ACTIONS:
+        raise LabError(f"unknown power action {action}")
+    return hub("vm", action, name).strip()

@@ -115,6 +115,23 @@ The login is the image's default user (`ubuntu`, `debian`, ...) with the passwor
 An Ubuntu guest needs 1 GB of RAM, and a spoke has 2 GB by default with 512 MB kept for itself.
 If `vm add` says no node has enough RAM free, add spokes or raise `SPOKE_MEM` in `cluster.conf`.
 
+### Starting and stopping guests
+
+```bash
+sudo ./cluster.sh hubctl vm stop web1     # shut down (ACPI); forced off if still up after a minute
+sudo ./cluster.sh hubctl vm start web1
+sudo ./cluster.sh hubctl vm reboot web1
+```
+
+The hub finds the guest's node itself. A guest keeps its address, SSH port and disk while it
+is off. Tenants do the same through the cloud API: `POST /tenant/vms/web1/stop`, `/start`,
+`/reboot`.
+
+Guests come back by themselves when their node restarts (after a reboot of the main PC:
+`up`, then `start all`). The exception is a guest stopped with `vm stop`: it stays off until
+someone starts it. A guest shut down from inside (`poweroff`) also stays off until the next
+restart of its node, or a `vm start`.
+
 ### Growing and shrinking
 
 ```bash
@@ -656,6 +673,7 @@ firewall rule only exists in the kernel. These are added while the lab runs and 
 | `ips [TENANT]` | address allocations and the next free one |
 | `vm add TENANT NAME [NODE] [--image I] [--ip A] [--mem MB] [--cpus N] [--disk SIZE]` | create a guest |
 | `vm info NAME`, `vm console NAME`, `vm del NAME`, `vms` | guests |
+| `vm start\|stop\|reboot NAME` | power; a stopped guest stays off when its node restarts |
 | `ports` | every guest's campus SSH port |
 | `image add NAME URL`, `image del NAME`, `images` | the image catalog |
 | `token` | the join token |

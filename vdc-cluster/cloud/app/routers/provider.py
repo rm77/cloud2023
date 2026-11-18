@@ -1,7 +1,7 @@
 # /provider - the CCRA Cloud Provider: onboarding, contracts, catalog, the pool of
 # nodes, and a view across every tenant.
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlmodel import Session, select
@@ -12,7 +12,7 @@ from ..db import Flavor, Job, Tenant, User, Vm, WorkerBeat, get_session, now, ut
 from ..infra import cluster as hub_cluster, images as hub_images, labhub, nodes as hub_nodes
 from ..schemas import (Accepted, FlavorModel, ImageIn, ImageOut, JobOut, NodeOut, ProviderUserIn, Quota,
                        SpokeAdd, TenantIn, TenantOut, TenantUpdate, UsageReport, UserOut, VmOut)
-from ..services import (audit, enqueue, hub_call, job_view, pick_network, vm_views)
+from ..services import (power_job, audit, enqueue, hub_call, job_view, pick_network, vm_views)
 from .tenant import tenant_out
 from .. import access
 from ..schemas import ConsoleIn, ConsoleOut, KeyIn, KeyOut, TunnelOut
@@ -391,3 +391,15 @@ def kill_tunnel(tid: str, c: Caller = Depends(provider), s: Session = Depends(ge
         raise HTTPException(404, f"no open tunnel {tid}")
     access.close_tunnel(s, c, t)
     return Response(status_code=204)
+
+
+# last: its {action} must not shadow /vms/{name}/console and /tunnels above
+@router.post("/vms/{name}/{action}", response_model=Accepted, status_code=202, tags=[PROV],
+             summary="Start, stop or reboot any VM (action: start | stop | reboot)")
+def power_any_vm(name: str, action: Literal["start", "stop", "reboot"], c: Caller = Depends(provider),
+                 s: Session = Depends(get_session)):
+    v = s.get(Vm, name)
+    if v is None:
+        raise HTTPException(404, f"no VM {name}")
+    t = s.get(Tenant, v.tenant_id)
+    return power_job(s, c, v, action, "/provider/jobs", tenant_name=t.name if t else "")

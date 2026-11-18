@@ -106,6 +106,7 @@ they may use, what it costs, and what happened.
 | `GET /tenant/network` | Provisioning | my subnet, gateway and address allocations |
 | `GET /tenant/vms` · `POST` | Provisioning | my VMs (`?state=true` for power state); create one (`202`) |
 | `GET /tenant/vms/{name}` · `DELETE` | Provisioning | one of my VMs; delete it (`202`) |
+| `POST /tenant/vms/{name}/start` · `/stop` · `/reboot` | Provisioning | power (`202` + job); a stopped VM stays off, and is not metered |
 | `GET /tenant/jobs` · `/{id}` | Provisioning | my jobs |
 | `GET /provider/tenants` · `POST` | Business support | all tenants; onboard one |
 | `GET/PATCH/DELETE /provider/tenants/{name}` | Business support | one tenant; off-board (refused while it has VMs) |
@@ -118,6 +119,7 @@ they may use, what it costs, and what happened.
 | `GET /provider/nodes` · `POST` · `DELETE /{name}` | Monitoring / Provisioning | members; add spokes (`202`); evict |
 | `GET /provider/hosts` · `/inventory` · `/health` | Monitoring & inventory | physical layer, inventory, health |
 | `GET /provider/vms` · `DELETE /{name}` | Provisioning | VMs of all tenants with their node |
+| `POST /provider/vms/{name}/start` · `/stop` · `/reboot` | Provisioning | power of any VM |
 | `GET /provider/jobs` · `/{id}` | Provisioning | all jobs |
 | `GET /tenant/access` | Access | my gateway, internet, jump host; per guest its campus SSH port (`ssh -p 460xx user@<lab PC>`) and the `ssh -J` alternative; a `~/.ssh/config` |
 | `GET /tenant/keys` · `POST` · `DELETE /{id}` | Access | my SSH keys: jump host login, put into new guests |
