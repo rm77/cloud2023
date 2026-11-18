@@ -101,12 +101,16 @@ CirrOS is built in. Any cloud image with cloud-init works too:
 ```bash
 sudo ./cluster.sh image add ubuntu ~/Downloads/noble-server-cloudimg-amd64.img
 sudo ./cluster.sh image add debian https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2 --user debian
+sudo ./cluster.sh image add alpine https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/alpine-3.22.8-x86_64-bios-cloudinit-r0.qcow2 --user alpine
 sudo ./cluster.sh images
 sudo ./cluster.sh hubctl vm add tenant-a web1 --image ubuntu
 ```
 
 A file is uploaded from this PC, and a URL is downloaded by the hub. The guest's hostname,
-password and address are handed over on a small cloud-init CD (NoCloud). For an image without
+password and SSH keys are handed over on a small cloud-init CD (NoCloud). The address comes
+from the hub's DHCP, which gives each guest the address reserved for it, with gateway and DNS.
+That works the same on Ubuntu, Debian and Alpine. `GUEST_NET=static` puts the address in the CD
+instead; that only works with images that use netplan (Ubuntu). For an image without
 cloud-init use `--type none`: the address is still reserved, but you set it inside the guest.
 
 The login is the image's default user (`ubuntu`, `debian`, ...) with the password `vdclab`
@@ -569,6 +573,7 @@ Updating a running cluster); the `CLOUD_*` lines only need `cloud restart`.
 | `TRACE` | changes | command journal: `changes`, `all` or `off` |
 | `TENANT_INTERNET` | on | internet for new tenants (`hubctl tenant set NAME internet on\|off` per tenant) |
 | `GUEST_SSH_PASSWORD` | no | `yes` lets the guest password work over SSH too (cloud-init images) |
+| `GUEST_NET` | dhcp | how cloud-init guests get their address: `dhcp` from the hub, or `static` in the seed (netplan images only) |
 | `EDGE`, `EDGE_IF`, `EDGE_ALLOW` | yes, (default route NIC), 0.0.0.0/0 | forward the ports below from the campus NIC, for these sources |
 | `EDGE_HUB_SSH` | 45022 | campus port of the hub's SSH |
 | `JUMP_PORT` | 45222 | SSH jump host, on the hub and on the main PC's campus side |
@@ -754,6 +759,7 @@ guest from there: what stops you?
 | `ssh -J` or `ssh -p 460xx` times out from campus | `sudo ./cluster.sh edge status` (is the guest's port listed? `edge sync`); `EDGE_ALLOW`; a campus firewall may block the port |
 | `ssh -p 460xx` asks for a password, or says Permission denied | the tenant's key was added after the guest was created: recreate it, or put the key in by hand on the console |
 | `ssh -p 460xx` warns the host key changed | the port belonged to a deleted guest before: `ssh-keygen -R "[<campus address>]:460xx"` |
+| an Alpine guest's eth0 is down | it was created with the address in its seed, which Alpine's cloud-init can't apply: `update`, then recreate the guest |
 | a guest has a 169.254.x.x address | it found no DHCP answer: the hub hands out each guest's IPAM address by DHCP (`/etc/dnsmasq.d/lab-tenants.conf`); `sudo ./cluster.sh update hub`, then restart the guest |
 | web console refused on the campus address | open `http://<campus address>:<port>/console/<SID>/`, not just the port; `edge status` should list the console range |
 | web console URL answers 404 | it was used once already, or expired: open a new one |

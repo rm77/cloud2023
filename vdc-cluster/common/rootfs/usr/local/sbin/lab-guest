@@ -12,7 +12,8 @@
 # (base/<image>-<sha12>.qcow2), so a guest's disk never loses its backing file.
 # Each guest gets a qcow2 overlay plus a seed ISO (label "cidata", NoCloud) that hands
 # over hostname, login password and the address the hub allocated:
-#   cloud-init images  user-data (#cloud-config) + network-config v2 (static, matched by MAC)
+#   cloud-init images  user-data (#cloud-config); the address by DHCP from the hub, or with
+#                      GUEST_NET=static a network-config v2 (matched by MAC, netplan images)
 #   cirros             JSON meta-data + user-data shell script (first boot); the hub's DHCP
 #                      gives the same address on every boot
 #   none               no seed: the address is reserved but not applied
@@ -65,6 +66,11 @@ UD
         echo "ssh_authorized_keys:" >>"$d/user-data"
         while IFS= read -r k; do [ -n "$k" ] && printf '  - "%s"\n' "$k" >>"$d/user-data"; done <"$keyfile"
       fi
+      # GUEST_NET=dhcp (default): no network-config, so cloud-init falls back to DHCP on the real
+      # interface (eth0 on Alpine, ens3/enp1s0 on Ubuntu) and the hub's DHCP hands out the
+      # reserved address, gateway and DNS. static: the address in the seed; netplan images only
+      # (Ubuntu) - Alpine's renderer cannot follow the MAC match below.
+      if [ "${GUEST_NET:-dhcp}" = static ]; then
       cat >"$d/network-config" <<NC
 # address allocated by the hub's IPAM (hubctl ips)
 version: 2
@@ -85,6 +91,7 @@ NC
       addresses: [${dns:-$gw}]
       search: [lab]
 NC
+      fi
       fi
       ;;
     cirros)
