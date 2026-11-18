@@ -1,0 +1,6 @@
+# example 2, step 1: one Alpine VM, with your SSH key in it.
+#   python vdc.py apply -f ex2-web-server/tenant.yaml
+keys:
+  - ~/.ssh/id_ed25519.pub          # a path, or the key itself ("ssh-ed25519 AAAA... me@laptop")
+vms:
+  - {name: web1, flavor: small, image: alpine}

@@ -1,0 +1,45 @@
+# example 2, step 3: web1 runs nginx with our page. Declarative too: it describes the end state
+# (package installed, file with this content, service running), and Ansible only changes what differs.
+#   ansible-playbook -i ex2-web-server/hosts.yml ex2-web-server/site.yml
+# Run it twice: the second run reports changed=0.
+
+- name: Web server
+  hosts: web
+  become: true
+  vars:
+    message: "Hello from {{ inventory_hostname }}, configured by Ansible on vdc-cluster"
+  tasks:
+    - name: nginx is installed
+      community.general.apk:
+        name: nginx
+        update_cache: true
+
+    - name: our page is in place
+      ansible.builtin.copy:
+        dest: /var/lib/nginx/html/index.html
+        content: |
+          <h1>{{ message }}</h1>
+      notify: reload nginx
+
+    - name: the default site serves that folder on port 80
+      ansible.builtin.copy:
+        dest: /etc/nginx/http.d/default.conf
+        content: |
+          server {
+              listen 80 default_server;
+              root /var/lib/nginx/html;
+              location / { try_files $uri $uri/ =404; }
+          }
+      notify: reload nginx
+
+    - name: nginx runs, now and after a reboot
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+  handlers:
+    - name: reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded

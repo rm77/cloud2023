@@ -1,0 +1,7 @@
+# example 1, the declarative way: WHAT should exist. vdc.py works out how to get there.
+#   python vdc.py plan  -f ex1-three-vms/tenant.yaml
+#   python vdc.py apply -f ex1-three-vms/tenant.yaml
+vms:
+  - {name: app1,  flavor: small, image: alpine}
+  - {name: app2,  flavor: small, image: alpine}
+  - {name: test1, flavor: tiny,  image: cirros}

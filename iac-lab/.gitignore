@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*/hosts.yml
+.vdc-state.json
+*/.vdc-state.json
+.vdc_known_hosts
+*.retry
