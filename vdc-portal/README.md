@@ -54,6 +54,12 @@ To keep it running, start it from a systemd unit, `tmux`, or `nohup python3 port
 | provider | dashboard (health, capacity, revenue); tenants (onboard, quota, internet, members, keys, off-board); accounts; import from hub; every tenant's VMs; images (import); machine types and prices; nodes (add spokes, evict); physical hosts; underlay; tunnels; jobs; billing; audit |
 | auditor | dashboard; audit log (filters, CSV); tenant reports; command journal; underlay; metering (the billing pages, read only) |
 
+Passwords: the API keeps only a hash, so nobody can look a password up. The provider resets one
+under Accounts (or a tenant's Members) with the key icon: the console deletes the account and
+creates it again with the same name, role, tenant and admin flag and the new password, and shows
+the password once. The tenant's VMs and keys are not touched. A login the user already has keeps
+working until it expires (8 hours).
+
 Long operations (create, delete, power, image import, adding spokes) answer `202`. The console
 follows each job under the bell icon and reloads the page when the job ends.
 

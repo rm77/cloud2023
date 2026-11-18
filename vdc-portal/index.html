@@ -1190,7 +1190,7 @@ async function usersPage() {
   return html`${pageHead("Accounts", btn("Create account", "user-add", {icon: "add"}), "Customers")}
     ${tcard("", "", table([{h: "User", f: u => html`<b>${u.username}</b>`}, {h: "Role", f: u => pill(u.role, u.role === "provider" ? "blue" : u.role === "auditor" ? "warn" : "")},
       {h: "Tenant", f: u => u.tenant ? html`<a href="#/tenants/${enc(u.tenant)}">${u.tenant}</a>${u.tenant_admin ? html` <span class="small muted">admin</span>` : ""}` : "—"},
-      {h: "Since", f: u => dt(u.created)}, {h: "", cls: "act", f: u => ibtn("del", "user-del", "Delete", {name: u.username}, u.username === S.me.username)}], us))}`;
+      {h: "Since", f: u => dt(u.created)}, {h: "", cls: "act", f: u => html`${ibtn("key", "user-reset", "Reset password", {name: u.username}, u.username === S.me.username)}${ibtn("del", "user-del", "Delete", {name: u.username}, u.username === S.me.username)}`}], us))}`;
 }
 ACT["user-add"] = async d => {
   const ts = await api("/provider/tenants");
@@ -1203,6 +1203,33 @@ ACT["user-add"] = async d => {
     onOk: v => { const b = {username: v.username.trim(), password: v.password, role: v.role, tenant_admin: v.tenant_admin};
       if (v.role === "consumer") { if (!v.tenant) throw new Error("choose the tenant of this consumer"); b.tenant = v.tenant; }
       return api("/provider/users", {method: "POST", body: b}); }})) { toast("Account created"); route(true); }
+};
+// The API keeps only password hashes and has no "change password" call, so a reset deletes the
+// account and creates it again with the same name, role, tenant and admin flag. VMs and keys
+// belong to the tenant (VMs record their owner by name), so nothing else changes.
+ACT["user-reset"] = async d => {
+  const u = (await api("/provider/users")).find(x => x.username === d.name);
+  if (!u) throw new Error(`no account ${d.name}`);
+  const pw = await modal({title: `Reset the password of ${u.username}`, ok: "Reset", danger: true, body: html`
+    <p>${u.role}${u.tenant ? ` in ${u.tenant}` : ""}${u.tenant_admin ? ", tenant admin" : ""}. The account is deleted and created again with
+      the same name, role and tenant, and the new password. The tenant's VMs, keys and network stay as they are.</p>
+    <div class="f"><label>New password</label><input type="text" name="password" value="${genPw()}" minlength="8" required>
+      <div class="hint">At least 8 characters. It is shown once more after the reset; hand it over yourself.</div></div>
+    ${note("A login the user already has keeps working until it expires (8 hours).", "warn")}`,
+    onOk: async v => {
+      if ((v.password || "").length < 8) throw new Error("the password needs at least 8 characters");
+      await api(`/provider/users/${enc(u.username)}`, {method: "DELETE"});
+      const b = {username: u.username, password: v.password, role: u.role, tenant_admin: !!u.tenant_admin};
+      if (u.tenant) b.tenant = u.tenant;
+      try { await api("/provider/users", {method: "POST", body: b}); }
+      catch (e) { throw new Error(`The old account was deleted but creating it again failed (${e.message}). ` +
+        `Create ${u.username} again under Accounts: role ${u.role}${u.tenant ? ", tenant " + u.tenant : ""}${u.tenant_admin ? ", tenant admin" : ""}.`); }
+      return v.password;
+    }});
+  if (!pw) return;
+  await modal({title: `New password for ${u.username}`, ok: "", cancel: "Close", body: html`${note("Shown only now. The API keeps a hash, not the password.")}
+    ${kv([["Console", copyLine(location.origin + "/")], ["Username", copyLine(u.username)], ["Password", copyLine(pw)]])}`});
+  route(true);
 };
 ACT["user-del"] = async d => {
   if (!await confirmDlg(`Delete account ${d.name}?`, "The user can no longer log in. What the user created stays.")) return;
@@ -1278,7 +1305,8 @@ async function tenantDetail({name}) {
     table([{h: "Status", f: v => st(vmState(v))}, {h: "Name", f: v => html`<a href="#/vms/${enc(v.name)}">${v.name}</a>`}, {h: "Type", f: v => v.flavor},
       {h: "IP", f: v => html`<span class="mono">${v.ip || "—"}</span>`}, {h: "Node", f: v => v.node || "—"}, {h: "", cls: "act", f: v => vmActions(v)}], vms, {empty: "No VMs."})}</div>
   <div class="grid"><div class="card p0"><div class="ch"><h2>Members</h2>${btn("Add", "user-add", {icon: "add", cls: "flat sm", data: {tenant: name}})}</div>
-    ${table([{h: "User", f: x => x.username}, {h: "Role", f: x => x.tenant_admin ? pill("tenant admin", "blue") : pill("member")}], members, {empty: "No users: add a tenant admin."})}</div>
+    ${table([{h: "User", f: x => x.username}, {h: "Role", f: x => x.tenant_admin ? pill("tenant admin", "blue") : pill("member")},
+      {h: "", cls: "act", f: x => ibtn("key", "user-reset", "Reset password", {name: x.username})}], members, {empty: "No users: add a tenant admin."})}</div>
   <div class="card p0"><div class="ch"><h2>SSH keys</h2>${btn("Add", "key-add", {icon: "add", cls: "flat sm", data: {tenant: name}})}</div>
     ${failed(keys) ? errorBox(keys.__error) : keysTable(keys, name)}</div></div>`;
 }
