@@ -50,6 +50,8 @@ def ips(name=None, **kw):
             continue
         if "<-" in f:                          # "tenant subnet 10.x.y.z  <- next free" (no MAC)
             rows.append(dict(tenant=f[0], subnet=f[1], ip=f[2], mac=None, guest=None, next_free=True))
+        elif len(f) >= 5 and f[3] == "-" and f[4].startswith("(extra"):   # extra address: no guest, no MAC
+            rows.append(dict(tenant=f[0], subnet=f[1], ip=f[2], mac=None, guest=None, next_free=False, extra=True))
         else:
             rows.append(dict(tenant=f[0], subnet=f[1], ip=f[2], mac=f[3], guest=f[4], next_free=False))
     return rows

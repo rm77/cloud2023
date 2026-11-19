@@ -32,15 +32,30 @@ def audit(s: Session, caller, action, target="", result="ok", detail="", tenant=
 
 # ---------------------------------------------------------------- quotas (CCRA contract management)
 def quota_of(t: Tenant) -> Quota:
+    def v(x, d):
+        return x if x is not None else d
     return Quota(max_vms=t.max_vms, max_vcpus=t.max_vcpus, max_mem_mb=t.max_mem_mb, max_disk_gb=t.max_disk_gb,
-                 max_tunnels=t.max_tunnels if t.max_tunnels is not None else 2)
+                 max_tunnels=v(t.max_tunnels, 2), max_ips=v(t.max_ips, 2), max_ports=v(t.max_ports, 5),
+                 max_floating_ips=v(t.max_floating_ips, 1))
 
 
-def usage_of(s: Session, t: Tenant) -> Usage:
-    """counted from the API's VM records, so VMs still being created already count"""
+def network_counts() -> dict:
+    """tenant -> {"ips": n, "ports": n, "floating_ips": n}, from the hub's registries"""
+    out = {}
+    for reg, key in (("extips", "ips"), ("tports", "ports"), ("fips", "floating_ips")):
+        for r in hub_call(labhub.hub_read, reg):
+            out.setdefault(r["tenant"], dict(ips=0, ports=0, floating_ips=0))[key] += 1
+    return out
+
+
+def usage_of(s: Session, t: Tenant, net: dict | None = None) -> Usage:
+    """counted from the API's VM records, so VMs still being created already count; extra
+    addresses, ports and floating IPs from the hub (pass network_counts() when listing many)"""
     from .db import Tunnel
+    n = (net if net is not None else network_counts()).get(t.name, {})
     u = Usage(vms=0, vcpus=0, mem_mb=0, disk_gb=0,
-              tunnels=len(s.exec(select(Tunnel).where(Tunnel.tenant_id == t.id, Tunnel.closed == False)).all()))  # noqa: E712
+              tunnels=len(s.exec(select(Tunnel).where(Tunnel.tenant_id == t.id, Tunnel.closed == False)).all()),  # noqa: E712
+              ips=n.get("ips", 0), ports=n.get("ports", 0), floating_ips=n.get("floating_ips", 0))
     flavors = {f.name: f for f in s.exec(select(Flavor))}
     hub_rows = None
     for v in s.exec(select(Vm).where(Vm.tenant_id == t.id, Vm.status != "error")):
@@ -163,6 +178,7 @@ def job_view(s: Session, j: Job) -> dict:
 def vm_views(s: Session, records: list[Vm], with_node=False, with_state=False) -> list[VmOut]:
     hub_rows = {r["name"]: r for r in hub_call(labhub.hub_read, "vms")}
     ports = guest_ports()
+    fips = guest_fips(hub_rows)
     users = {}
     if ports and records:
         users = {r["name"]: r["user"] for r in hub_call(labhub.hub_read, "images")}
@@ -178,6 +194,7 @@ def vm_views(s: Session, records: list[Vm], with_node=False, with_state=False) -
         out.append(VmOut(name=v.name, tenant=tenants.get(v.tenant_id, "?"), flavor=v.flavor, image=v.image,
                          status=v.status, ip=h.get("ip") or None, mac=h.get("mac") or None,
                          ssh_port=ports.get(v.name), ssh=ssh_direct(ports.get(v.name), users.get(v.image, "root")),
+                         floating_ip=fips.get(v.name),
                          vcpus=f.vcpus if f else int(h.get("cpus") or 1),
                          mem_mb=f.mem_mb if f else int(h.get("mem") or 0),
                          node=h.get("node") if with_node else None,
@@ -191,6 +208,19 @@ def guest_ports() -> dict:
     if not config.EDGE:
         return {}
     return {r["name"]: int(r["port"]) for r in hub_call(labhub.hub_read, "ports") if r["port"].isdigit()}
+
+
+def guest_fips(hub_rows: dict) -> dict:
+    """VM name -> its floating IP (attached by name or by the VM's address)"""
+    by_ip = {(r["tenant"], r["ip"]): n for n, r in hub_rows.items()}
+    out = {}
+    for r in hub_call(labhub.hub_read, "fips"):
+        g = r["target"]
+        if g in hub_rows and hub_rows[g]["tenant"] == r["tenant"]:
+            out[g] = r["fip"]
+        elif (r["tenant"], g) in by_ip:
+            out[by_ip[(r["tenant"], g)]] = r["fip"]
+    return out
 
 
 def ssh_direct(port, user) -> str | None:
@@ -207,9 +237,10 @@ def refresh_edge():
 
 def tenant_allocations(t: Tenant):
     rows = hub_call(hub_tenants.ips, t.name)
-    return [dict(ip=r["ip"], mac=r["mac"], vm=r["guest"], next_free=r["next_free"]) for r in rows]
+    return [dict(ip=r["ip"], mac=r["mac"], vm=r["guest"], next_free=r["next_free"], extra=r.get("extra", False))
+            for r in rows]
 
 
-__all__ = ["hub_call", "audit", "quota_of", "usage_of", "check_quota", "pick_network", "gateway_of",
+__all__ = ["hub_call", "audit", "quota_of", "usage_of", "network_counts", "guest_fips", "check_quota", "pick_network", "gateway_of",
            "enqueue", "job_view", "vm_views", "tenant_allocations", "hub_vms", "guest_ports", "ssh_direct",
            "refresh_edge", "power_job"]

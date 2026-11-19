@@ -89,6 +89,11 @@ they may use, what it costs, and what happened.
   consoles. They close on expiry, on `DELETE`, when the API stops, or when their `cloudflared`
   dies.
 - **Onboarding takes `"internet": false`** for tenants that start without internet access.
+- **Extra addresses, ports and floating IPs live on the hub**, not in the API's database, so
+  `hubctl` and the API always agree. Their quota (`max_ips`, `max_ports`, `max_floating_ips`;
+  defaults 2, 5, 1) is counted from the hub's registries. A target is one of the tenant's VMs or
+  one of its addresses; anything else gives `409`, another tenant's floating IP or port `404`.
+  Every change runs `cluster.sh edge sync`, so the main PC forwards it at once.
 - **Errors:** `409` = the cluster refused (the message is hubctl's own), `502` = the hub couldn't
   be reached.
 
@@ -130,6 +135,12 @@ they may use, what it costs, and what happened.
 | `POST /tenant/vms/{name}/tunnels` `{"protocol": "http", "port": 80}` | Access | publish a port of my VM on the internet (Cloudflare quick tunnel) |
 | `GET /tenant/tunnels` · `DELETE /{id}` | Access | my open tunnels |
 | `GET /provider/tunnels` · `DELETE /{id}` | Access | every open tunnel |
+| `GET /tenant/ips` · `POST` · `DELETE /{ip}` | Access | my extra addresses: in my subnet, given to no VM (MetalLB, keepalived) |
+| `GET /tenant/ports` · `POST` · `DELETE /{campus_port}` | Access | ports on the lab PC for my VMs' services: `{"target": "a1", "port": 80}` → `<lab PC>:47000` |
+| `GET /tenant/floating-ips` · `POST` · `DELETE /{ip}` | Access | my floating IPs; `{"target": "a1"}` attaches it at once |
+| `POST /tenant/floating-ips/{ip}/associate` · `/disassociate` | Access | attach to a VM or address (every port, and its own traffic leaves from it); detach |
+| `GET /provider/ips` · `/ports` · `/floating-ips` | Access | the same for every tenant; the whole floating IP pool, free addresses too |
+| `DELETE /provider/ips/{ip}` · `/ports/{port}` · `/floating-ips/{ip}`, `POST /provider/floating-ips/{ip}/disassociate` | Access | take any of them back |
 | `POST /provider/vms/{name}/console` | Access | web console of any VM |
 | `GET /console/{id}/` | (browser) | the console page and its WebSocket, passed through to ttyd on the hub |
 | `GET /audit/events` | Auditor | API audit log (filter by tenant, user, action, result, since) |
@@ -137,6 +148,7 @@ they may use, what it costs, and what happened.
 | `GET /audit/metering` | Auditor | usage of every tenant |
 | `GET /audit/journal?node=&tool=&lines=` | Auditor | what the cluster really ran (the kit's command journal) |
 | `GET /carrier/underlay` | Carrier | full-MTU path to the hub, node reachability |
+| `GET /carrier/floating-ips` | Carrier | the edge addresses: floating IP pool and what each one carries |
 
 ## Running it (from the kit folder, main PC)
 
@@ -239,10 +251,11 @@ Or open `http://10.20.1.1:36100/docs`, press **Authorize**, log in as any user, 
 
 `tests/` runs the whole story against a stand-in hub (`tests/fakehub.py`), with its own
 temporary database.
-That story is onboarding, isolation, quotas, a failing job, metering and the auditor's view:
+That story is onboarding, isolation, quotas, a failing job, metering, the auditor's view, and
+extra addresses, ports and floating IPs:
 
 ```sh
-sudo ./cluster.sh cloud install --dev && sudo ./cluster.sh cloud test     # 43 passed
+sudo ./cluster.sh cloud install --dev && sudo ./cluster.sh cloud test     # 55 passed
 ```
 
 ## What is not here yet (needs small changes to the kit)
@@ -253,4 +266,4 @@ sudo ./cluster.sh cloud install --dev && sudo ./cluster.sh cloud test     # 43 p
 | VM export / snapshot | qcow2 export on the node, served by the hub |
 | Broker (several clusters) | a `cluster` field and one `labhub` target per cluster |
 | Web portals | separate front ends on this API; `/docs` serves meanwhile |
-| Floating IPs, security groups | the next step after the tenant router, jump host and tunnels |
+| Security groups | per-tenant firewall rules on the hub, next to the tenant router |

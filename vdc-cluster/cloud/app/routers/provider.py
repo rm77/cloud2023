@@ -12,7 +12,9 @@ from ..db import Flavor, Job, Tenant, User, Vm, WorkerBeat, get_session, now, ut
 from ..infra import cluster as hub_cluster, images as hub_images, labhub, nodes as hub_nodes
 from ..schemas import (Accepted, FlavorModel, ImageIn, ImageOut, JobOut, NodeOut, ProviderUserIn, Quota,
                        SpokeAdd, TenantIn, TenantOut, TenantUpdate, UsageReport, UserOut, VmOut)
-from ..services import (power_job, audit, enqueue, hub_call, job_view, pick_network, vm_views)
+from ..services import (power_job, audit, enqueue, hub_call, job_view, network_counts, pick_network, vm_views)
+from ..schemas import ExtraIpOut, FloatingIpOut, PortOut
+from .. import network as netsvc
 from .tenant import tenant_out
 from .. import access
 from ..schemas import ConsoleIn, ConsoleOut, KeyIn, KeyOut, TunnelOut
@@ -38,8 +40,8 @@ def tenant_or_404(s, name) -> Tenant:
 # ---------------------------------------------------------------- customers and contracts
 @router.get("/tenants", response_model=list[TenantOut], tags=[CUST], summary="All tenants")
 def tenants(s: Session = Depends(get_session)):
-    hubmap = access.hub_tenants()
-    return [tenant_out(s, t, hubmap) for t in s.exec(select(Tenant).order_by(Tenant.vni))]
+    hubmap, net = access.hub_tenants(), network_counts()
+    return [tenant_out(s, t, hubmap, net) for t in s.exec(select(Tenant).order_by(Tenant.vni))]
 
 
 @router.post("/tenants", response_model=TenantOut, status_code=201, tags=[CUST],
@@ -394,6 +396,47 @@ def kill_tunnel(tid: str, c: Caller = Depends(provider), s: Session = Depends(ge
 
 
 # last: its {action} must not shadow /vms/{name}/console and /tunnels above
+# ---- extra addresses, campus ports, floating IPs of every tenant
+@router.get("/ips", response_model=list[ExtraIpOut], tags=[ACC], summary="Extra addresses of every tenant")
+def all_ips(tenant: Optional[str] = None):
+    return netsvc.list_ips(tenant)
+
+
+@router.delete("/ips/{ip}", status_code=204, tags=[ACC], summary="Release any extra address")
+def delete_ip(ip: str, c: Caller = Depends(provider), s: Session = Depends(get_session)):
+    netsvc.delete_ip(s, c, None, ip)
+    return Response(status_code=204)
+
+
+@router.get("/ports", response_model=list[PortOut], tags=[ACC], summary="Campus ports of every tenant")
+def all_ports(tenant: Optional[str] = None):
+    return netsvc.list_ports(tenant)
+
+
+@router.delete("/ports/{campus_port}", status_code=204, tags=[ACC], summary="Close any campus port")
+def delete_port(campus_port: int, c: Caller = Depends(provider), s: Session = Depends(get_session)):
+    netsvc.delete_port(s, c, None, campus_port)
+    return Response(status_code=204)
+
+
+@router.get("/floating-ips", response_model=list[FloatingIpOut], tags=[ACC],
+            summary="The floating IP pool (FLOATING_POOL): booked, attached and free")
+def all_fips(tenant: Optional[str] = None):
+    return netsvc.list_fips(tenant, free=tenant is None)
+
+
+@router.post("/floating-ips/{fip}/disassociate", response_model=FloatingIpOut, tags=[ACC],
+             summary="Detach any floating IP (it stays booked by its tenant)")
+def disassociate_fip(fip: str, c: Caller = Depends(provider), s: Session = Depends(get_session)):
+    return netsvc.disassociate_fip(s, c, None, fip)
+
+
+@router.delete("/floating-ips/{fip}", status_code=204, tags=[ACC], summary="Take any floating IP back to the pool")
+def release_fip(fip: str, c: Caller = Depends(provider), s: Session = Depends(get_session)):
+    netsvc.release_fip(s, c, None, fip)
+    return Response(status_code=204)
+
+
 @router.post("/vms/{name}/{action}", response_model=Accepted, status_code=202, tags=[PROV],
              summary="Start, stop or reboot any VM (action: start | stop | reboot)")
 def power_any_vm(name: str, action: Literal["start", "stop", "reboot"], c: Caller = Depends(provider),

@@ -19,6 +19,8 @@ from .. import tasks
 from .. import access
 from ..db import ConsoleSession, Tunnel
 from ..schemas import AccessOut, ConsoleIn, ConsoleOut, KeyIn, KeyOut, TunnelIn, TunnelOut
+from ..schemas import AssociateIn, ExtraIpIn, ExtraIpOut, FloatingIpIn, FloatingIpOut, PortIn, PortOut
+from .. import network as netsvc
 
 PROV = "Provisioning & configuration"
 BIZ = "Business support"
@@ -29,11 +31,11 @@ router = APIRouter(prefix="/tenant", dependencies=[Depends(require_role("consume
 consumer = require_role("consumer")
 
 
-def tenant_out(s, t, hubmap=None):
+def tenant_out(s, t, hubmap=None, net=None):
     hubmap = hubmap if hubmap is not None else access.hub_tenants()
     return TenantOut(name=t.name, display_name=t.display_name, vni=t.vni, subnet=t.subnet,
                      gateway=gateway_of(t.subnet), internet=access.internet_of(hubmap.get(t.name)),
-                     jump_user=f"t-{t.name}", quota=quota_of(t), usage=usage_of(s, t), created=t.created)
+                     jump_user=f"t-{t.name}", quota=quota_of(t), usage=usage_of(s, t, net), created=t.created)
 
 
 def my_vm(name: str, c: Caller = Depends(consumer), s: Session = Depends(get_session)) -> Vm:
@@ -121,6 +123,10 @@ def create_vm(body: VmIn, c: Caller = Depends(consumer), s: Session = Depends(ge
         raise HTTPException(409, f"VM name {body.name} is taken (names are unique in the whole cluster)")
     try:
         check_quota(s, t, f)
+        if body.floating_ip:
+            u, q = usage_of(s, t), quota_of(t)
+            if u.floating_ips + 1 > q.max_floating_ips:
+                raise HTTPException(403, f"quota exceeded: floating ips {u.floating_ips + 1}/{q.max_floating_ips}")
     except HTTPException as e:
         audit(s, c, "vm.create", body.name, "denied", e.detail)
         raise
@@ -128,12 +134,14 @@ def create_vm(body: VmIn, c: Caller = Depends(consumer), s: Session = Depends(ge
     s.add(rec); s.commit()                      # counts against the quota from now on
     try:
         j = enqueue(s, c, "vm.create", body.name, tasks.create_vm, tenant_id=t.id,
-                    name=body.name, tenant=t.name, flavor=f.name, image=body.image, ip=body.ip)
+                    name=body.name, tenant=t.name, flavor=f.name, image=body.image, ip=body.ip,
+                    floating_ip=body.floating_ip)
     except HTTPException:
         s.delete(rec); s.commit()               # nothing was queued: release name and quota
         raise
     rec.job_id = j.id; s.add(rec); s.commit()
-    audit(s, c, "vm.create", body.name, "accepted", f"flavor {f.name}, image {body.image}, job {j.id}")
+    audit(s, c, "vm.create", body.name, "accepted", f"flavor {f.name}, image {body.image}"
+          f"{', floating IP' if body.floating_ip else ''}, job {j.id}")
     return Accepted(job=j.id, status_url=f"/tenant/jobs/{j.id}")
 
 
@@ -254,4 +262,72 @@ def close_tunnel(tid: str, c: Caller = Depends(consumer), s: Session = Depends(g
     if t is None or t.tenant_id != c.tenant.id or t.closed:
         raise HTTPException(404, "no such tunnel in your tenant")
     access.close_tunnel(s, c, t)
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------- extra addresses, campus ports, floating IPs
+# Kept by the hub; the lab PC forwards them. A target is one of my VMs or an address of my subnet.
+@router.get("/ips", response_model=list[ExtraIpOut], tags=[ACC],
+            summary="My extra addresses: in my subnet, given to no VM (service addresses, e.g. MetalLB)")
+def my_ips(c: Caller = Depends(consumer)):
+    return netsvc.list_ips(c.tenant_name)
+
+
+@router.post("/ips", response_model=ExtraIpOut, status_code=201, tags=[ACC],
+             summary="Reserve an extra address of my subnet (no DHCP hands it out)")
+def add_ip(body: ExtraIpIn | None = None, c: Caller = Depends(consumer), s: Session = Depends(get_session)):
+    body = body or ExtraIpIn()
+    return netsvc.add_ip(s, c, c.tenant, body.ip, body.note)
+
+
+@router.delete("/ips/{ip}", status_code=204, tags=[ACC],
+               summary="Release an extra address (its campus ports and floating IP let go of it)")
+def delete_ip(ip: str, c: Caller = Depends(consumer), s: Session = Depends(get_session)):
+    netsvc.delete_ip(s, c, c.tenant, ip)
+    return Response(status_code=204)
+
+
+@router.get("/ports", response_model=list[PortOut], tags=[ACC], summary="My campus ports")
+def my_ports(c: Caller = Depends(consumer)):
+    return netsvc.list_ports(c.tenant_name)
+
+
+@router.post("/ports", response_model=PortOut, status_code=201, tags=[ACC],
+             summary="Open a port of my VM (or address) on the lab PC's campus address: connect to <lab PC>:campus_port")
+def add_port(body: PortIn, c: Caller = Depends(consumer), s: Session = Depends(get_session)):
+    return netsvc.add_port(s, c, c.tenant, body.target, body.port, body.protocol, body.campus_port)
+
+
+@router.delete("/ports/{campus_port}", status_code=204, tags=[ACC], summary="Close one of my campus ports")
+def delete_port(campus_port: int, c: Caller = Depends(consumer), s: Session = Depends(get_session)):
+    netsvc.delete_port(s, c, c.tenant, campus_port)
+    return Response(status_code=204)
+
+
+@router.get("/floating-ips", response_model=list[FloatingIpOut], tags=[ACC], summary="My floating IPs")
+def my_fips(c: Caller = Depends(consumer)):
+    return netsvc.list_fips(c.tenant_name)
+
+
+@router.post("/floating-ips", response_model=FloatingIpOut, status_code=201, tags=[ACC],
+             summary="Book a floating IP (a campus address), and attach it to a VM or address if target is given")
+def alloc_fip(body: FloatingIpIn | None = None, c: Caller = Depends(consumer), s: Session = Depends(get_session)):
+    return netsvc.alloc_fip(s, c, c.tenant, (body or FloatingIpIn()).target)
+
+
+@router.post("/floating-ips/{fip}/associate", response_model=FloatingIpOut, tags=[ACC],
+             summary="Attach my floating IP to a VM or address: every port, and its own traffic leaves from it")
+def associate_fip(fip: str, body: AssociateIn, c: Caller = Depends(consumer), s: Session = Depends(get_session)):
+    return netsvc.associate_fip(s, c, c.tenant, fip, body.target)
+
+
+@router.post("/floating-ips/{fip}/disassociate", response_model=FloatingIpOut, tags=[ACC],
+             summary="Detach my floating IP (it stays booked)")
+def disassociate_fip(fip: str, c: Caller = Depends(consumer), s: Session = Depends(get_session)):
+    return netsvc.disassociate_fip(s, c, c.tenant, fip)
+
+
+@router.delete("/floating-ips/{fip}", status_code=204, tags=[ACC], summary="Give my floating IP back to the pool")
+def release_fip(fip: str, c: Caller = Depends(consumer), s: Session = Depends(get_session)):
+    netsvc.release_fip(s, c, c.tenant, fip)
     return Response(status_code=204)

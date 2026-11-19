@@ -164,9 +164,13 @@ on it lead inside:
 | 45222 | hub, port 45222 | tenant jump host |
 | 45300-45399 | hub, same port | web consoles (ttyd), directly |
 | 46000-46999 | one guest each, port 22 | SSH straight to a guest |
+| 47000-47999 | a port a tenant booked on one of its guests | any other service: a web server, a game server |
 
-So a guest can be reached with its own SSH port, through the jump host, in the web console,
-through a Cloudflare tunnel from the internet, and, for staff, directly from the main PC.
+A guest can also have a floating IP: a campus address of its own, with every port.
+
+So a guest can be reached with its own SSH port, a booked port, a floating IP, through the
+jump host, in the web console, through a Cloudflare tunnel from the internet, and, for staff,
+directly from the main PC.
 
 ### Internet on or off
 
@@ -237,7 +241,8 @@ themselves; after creating guests on the hub directly, run `sudo ./cluster.sh ed
 |---|---|---|
 | `EDGE_ALLOW` | 0.0.0.0/0 | who may connect, e.g. `10.28.84.0/24`, or several: `10.28.84.0/24,10.30.0.0/16` |
 | `EDGE_IF` | the NIC with the default route | the campus network card |
-| `EDGE_HUB_SSH`, `JUMP_PORT`, `WEBCONSOLE_PORTS`, `VM_SSH_PORTS` | 45022, 45222, 45300-45399, 46000-46999 | the ports; an empty value switches that forward off |
+| `EDGE_HUB_SSH`, `JUMP_PORT`, `WEBCONSOLE_PORTS`, `VM_SSH_PORTS`, `TENANT_PORTS` | 45022, 45222, 45300-45399, 46000-46999, 47000-47999 | the ports; an empty value switches that forward off |
+| `FLOATING_POOL` | (empty) | campus addresses for floating IPs; empty: none |
 | `EDGE` | yes | `no` keeps everything reachable from the lab PCs only |
 
 Only connections to the main PC's own address on that card are forwarded. The port
@@ -249,6 +254,78 @@ to the hub's `/root/.ssh/authorized_keys`:
 ```bash
 ssh -p 45022 -i state/id_lab root@10.28.84.254
 ```
+
+### Ports for other services
+
+A tenant can book a port on the main PC for any TCP or UDP service of its guests. The hub hands
+out the next free one of 47000-47999 (`TENANT_PORTS`):
+
+```bash
+sudo ./cluster.sh hubctl port add tenant-a a1 80              # prints e.g. 47000
+sudo ./cluster.sh hubctl port add tenant-a a1 5353 --proto udp
+sudo ./cluster.sh hubctl port list tenant-a
+sudo ./cluster.sh hubctl port del 47000
+```
+
+From campus, `http://<main PC>:47000/` now reaches the web server on a1. The guest sees the
+connection coming from the main PC (its underlay address), as with the SSH ports. As a tenant:
+`POST /tenant/ports` with `{"target": "a1", "port": 80}`; the answer has the campus port and a
+`connect` line. A port is removed with its guest. Each tenant may have 5 (`max_ports` in the
+quota).
+
+### Extra addresses
+
+An extra address is an address of the tenant's subnet that belongs to no guest. The hub keeps
+it out of the IPAM, so no guest is created with it and DHCP never hands it out. Use it for an
+address that moves between guests or that software announces itself: a Kubernetes
+LoadBalancer pool (MetalLB), a keepalived VIP, or a second address set by hand inside a guest.
+
+```bash
+sudo ./cluster.sh hubctl ip add tenant-a --note metallb         # next free one, e.g. 10.199.20.12
+sudo ./cluster.sh hubctl ip add tenant-a 10.199.20.200          # a given one
+sudo ./cluster.sh hubctl ips tenant-a                           # listed as (extra)
+sudo ./cluster.sh hubctl ip del 10.199.20.200
+```
+
+Ports and floating IPs can point at an extra address as well as at a guest. As a tenant:
+`POST /tenant/ips` (`{"note": "metallb"}`, or `{"ip": "..."}`), 2 per tenant (`max_ips`).
+
+### Floating IPs
+
+A floating IP is a campus address that belongs to one guest (or extra address) while it is
+attached: every port of it reaches the guest, the guest sees the real client address, and the
+guest's own connections to campus and the internet leave from it. The main PC holds the
+address on its campus network card and translates it 1:1; the hub sends the guest's traffic
+back through the main PC instead of its own uplink.
+
+The addresses come from `FLOATING_POOL` in `cluster.conf`. Ask the campus network for a few
+addresses on the main PC's segment that nothing else uses, put them in, and run
+`sudo ./cluster.sh update`:
+
+```bash
+FLOATING_POOL=<first>-<last>          # or single addresses, comma-separated
+```
+
+A tenant books one, then attaches it. Detaching keeps it booked for the tenant; releasing
+gives it back:
+
+```bash
+sudo ./cluster.sh hubctl fip alloc tenant-a                      # prints the address
+sudo ./cluster.sh hubctl fip assoc <floating IP> a1
+ssh ubuntu@<floating IP>                                         # from campus
+sudo ./cluster.sh hubctl fip dissoc <floating IP>
+sudo ./cluster.sh hubctl fip release <floating IP>
+sudo ./cluster.sh hubctl fips                                    # the pool: booked, attached, free
+```
+
+In the cloud API: `POST /tenant/floating-ips` (with `{"target": "a1"}` to attach it at once),
+`POST /tenant/floating-ips/{ip}/associate` and `/disassociate`, `DELETE /tenant/floating-ips/{ip}`,
+or `"floating_ip": true` when creating a VM. Each tenant may book 1 (`max_floating_ips`). When
+the guest is deleted, its floating IP stays booked and is detached.
+
+`EDGE_ALLOW` applies to floating IPs too. With the tenant's internet off, the guest is still
+reachable on its floating IP but can't open connections out. A floating IP is only reachable
+from other machines on campus, not from the main PC itself, and not from another tenant's guests.
 
 ### Web console
 
@@ -579,6 +656,8 @@ Updating a running cluster); the `CLOUD_*` lines only need `cloud restart`.
 | `JUMP_PORT` | 45222 | SSH jump host, on the hub and on the main PC's campus side |
 | `WEBCONSOLE_PORTS`, `WEBCONSOLE_MINUTES` | 45300-45399, 60 | ttyd web consoles on the hub, forwarded with the same ports |
 | `VM_SSH_PORTS` | 46000-46999 | one campus SSH port per guest |
+| `TENANT_PORTS` | 47000-47999 | ports tenants book for their guests' services |
+| `FLOATING_POOL` | (empty) | campus addresses for floating IPs, e.g. `<first>-<last>,<other>` |
 | `CLOUD_PORT` | 36100 | the cloud API |
 | `CLOUD_QUEUE` | redis | the API's job queue: `redis` (private instance) or `sqlite` (no Redis at all) |
 | `CLOUD_TUNNELS`, `CLOUD_TUNNEL_HOURS`, `CLOUD_TUNNELS_PER_TENANT` | yes, 8, 2 | Cloudflare quick tunnels |
@@ -639,7 +718,8 @@ firewall rule only exists in the kernel. These are added while the lab runs and 
 |---|---|---|
 | bridge `br-under`, a `tap-<vm>` per VM | `init`, `up`, `spoke add` | `rm`, `net-down` |
 | iptables `FORWARD` rule for `br-under` (when Docker or ufw filter bridges) | `net-up` | `net-down` |
-| iptables chains `VDC-EDGE` and `VDC-EDGE-FWD` (the forwarded ports), routes to the tenant subnets | `up`, `edge up`, `edge sync` | `edge down`, `net-down` |
+| iptables chains `VDC-EDGE` and `VDC-EDGE-FWD` (the forwarded ports), `VDC-FIP` and `VDC-FIP-POST` (floating IPs), routes to the tenant subnets | `up`, `edge up`, `edge sync` | `edge down`, `net-down` |
+| the attached floating IPs on the campus NIC (listed in `state/edge.fips`) | `edge up`, `edge sync` | `edge down`, `edge sync` once detached |
 | `net.ipv4.ip_forward=1` (needed for the forwards) | `edge up` | `edge down`, `net-down` (back to its old value) |
 | three systemd units for the cloud API | `cloud enable` (optional) | `cloud disable` |
 
@@ -662,7 +742,7 @@ firewall rule only exists in the kernel. These are added while the lab runs and 
 | `logs`, `logs tail NAME`, `logs collect`, `logs commands [TOOL]` | logs and the command journal |
 | `host init ID [NIC]`, `host show`, `host export` | multi-PC setup |
 | `net-up`, `net-down`, `mtu-check` | the underlay network |
-| `edge up\|down\|status\|sync` | main PC: the campus ports to the hub and the guests, routes to tenant subnets |
+| `edge up\|down\|status\|sync` | main PC: the campus ports to the hub and the guests, floating IPs, routes to tenant subnets |
 | `update [all\|hub\|spokes]` | bring changed lab scripts and settings to the running VMs |
 | `cloud install\|start\|stop\|status\|logs\|admin\|enable\|disable\|test` | the cloud API |
 
@@ -675,7 +755,10 @@ firewall rule only exists in the kernel. These are added while the lab runs and 
 | `tenant set NAME internet on\|off` | internet for the tenant's guests |
 | `key add TENANT 'KEY'`, `key del TENANT FINGERPRINT`, `keys TENANT` | the tenant's SSH keys (jump host, new guests) |
 | `console start GUEST SID CRED`, `console stop SID`, `consoles` | web consoles (called by the cloud API) |
-| `ips [TENANT]` | address allocations and the next free one |
+| `ips [TENANT]` | address allocations (guests and extra addresses) and the next free one |
+| `ip add TENANT [ADDR] [--note WORD]`, `ip del ADDR` | extra addresses of a tenant subnet |
+| `port add TENANT TARGET PORT [--proto tcp\|udp] [--at CAMPUS_PORT]`, `port del CAMPUS_PORT`, `port list [TENANT]` | ports on the main PC for a guest's (or extra address's) service |
+| `fip alloc TENANT [ADDR]`, `fip assoc FIP TARGET`, `fip dissoc FIP`, `fip release FIP`, `fips [TENANT]` | floating IPs |
 | `vm add TENANT NAME [NODE] [--image I] [--ip A] [--mem MB] [--cpus N] [--disk SIZE]` | create a guest |
 | `vm info NAME`, `vm console NAME`, `vm del NAME`, `vms` | guests |
 | `vm start\|stop\|reboot NAME` | power; a stopped guest stays off when its node restarts |
@@ -762,6 +845,10 @@ guest from there: what stops you?
 | an Alpine guest's eth0 is down | it was created with the address in its seed, which Alpine's cloud-init can't apply: `update`, then recreate the guest |
 | a recreated guest gets 169.254.x.x, and the hub's dnsmasq log says `not using configured address … because it is leased to` another MAC | the deleted guest's lease was still valid; `vm add`, `vm del` and `update hub` now release it (restart the guest's network afterwards) |
 | a guest has a 169.254.x.x address | it found no DHCP answer: the hub hands out each guest's IPAM address by DHCP (`/etc/dnsmasq.d/lab-tenants.conf`); `sudo ./cluster.sh update hub`, then restart the guest |
+| a booked port times out from campus | `sudo ./cluster.sh edge status` lists it under `tenant port`? Is the service listening on that port inside the guest (`ss -ltn`)? |
+| `no floating IPs: FLOATING_POOL is empty` | set `FLOATING_POOL` in `cluster.conf`, then `sudo ./cluster.sh update` |
+| a floating IP doesn't answer | `edge status` lists it under `floating ip`, `ip addr` shows it on the campus NIC; test from another campus machine, not the main PC; the address must be free on the campus segment (`arping` it with the edge down) |
+| a guest with a floating IP has no internet | the tenant's internet is off, or the campus network blocks the address going out; `hubctl exec hub ip rule` should list the guest's address |
 | web console refused on the campus address | open `http://<campus address>:<port>/console/<SID>/`, not just the port; `edge status` should list the console range |
 | web console URL answers 404 | it was used once already, or expired: open a new one |
 | web console says ttyd is not installed | `sudo ./cluster.sh update hub` installs it |

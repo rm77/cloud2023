@@ -18,6 +18,10 @@ class FakeHub:
         self.images = {"cirros": "cirros cirros 192 1G cirros abc 20"}
         self.nodes = [("hv101", "10.20.1.101", "52:54:00:21:01:01"), ("hv102", "10.20.1.102", "52:54:00:21:01:02")]
         self.calls = []
+        self.extips = {}               # ip -> (tenant, note)
+        self.tports = {}               # campus port -> (proto, tenant, target, to)
+        self.fips = {}                 # fip -> (tenant, target or "-")
+        self.pool = [f"10.28.84.{i}" for i in range(200, 204)]
 
     # labhub._run replacement
     def run(self, argv, timeout=0):
@@ -44,9 +48,101 @@ class FakeHub:
             return "".join(f"{n} {46000 + i}\n" for i, n in enumerate(self.vms))
         if name == "images":
             return "".join(l + "\n" for l in self.images.values())
+        if name == "extips":
+            return "".join(f"{a} {t} {n}\n" for a, (t, n) in self.extips.items())
+        if name == "tports":
+            return "".join(f"{p} {pr} {t} {g} {to}\n" for p, (pr, t, g, to) in self.tports.items())
+        if name == "fips":
+            return "".join(f"{f} {t} {g}\n" for f, (t, g) in self.fips.items())
         return ""
 
+    def target_addr(self, t, g):
+        if g in self.vms and self.vms[g]["tenant"] == t:
+            return self.vms[g]["ip"]
+        if any(v["tenant"] == t and v["ip"] == g for v in self.vms.values()):
+            return g
+        if self.extips.get(g, ("",))[0] == t:
+            return g
+        return None
+
+    def prune(self):
+        self.tports = {p: r for p, r in self.tports.items() if self.target_addr(r[1], r[2])}
+        self.fips = {f: (t, g if g == "-" or self.target_addr(t, g) else "-") for f, (t, g) in self.fips.items()
+                     if t in self.tenants}
+
+    def network(self, a):
+        L = labhub.LabError
+        if a[:2] == ["ip", "add"]:
+            t, rest = a[2], a[3:]
+            note = rest[rest.index("--note") + 1] if "--note" in rest else "-"
+            given = [x for x in rest if x[0].isdigit()]
+            net = IPv4Network(self.tenants[t][1])
+            used = {v["ip"] for v in self.vms.values() if v["tenant"] == t} | set(self.extips)
+            ip = given[0] if given else next(str(h) for h in list(net.hosts())[9:] if str(h) not in used)
+            if ip in used:
+                raise L(f"ADDR: {ip} is already used in tenant {t}")
+            self.extips[ip] = (t, note); return ip + "\n"
+        if a[:2] == ["ip", "del"]:
+            if a[2] not in self.extips:
+                raise L(f"no extra address {a[2]} (hubctl ips)")
+            del self.extips[a[2]]; self.prune(); return f"{a[2]} released\n"
+        if a[:2] == ["port", "add"]:
+            t, g, to = a[2], a[3], a[4]
+            opt = dict(zip(a[5::2], a[6::2]))
+            if not self.target_addr(t, g):
+                raise L(f"{g} is not a guest or address of tenant {t} (hubctl ips {t})")
+            p = opt.get("--at") or str(next(n for n in range(47000, 48000) if str(n) not in self.tports))
+            if p in self.tports:
+                raise L(f"campus port {p} is taken")
+            self.tports[p] = (opt.get("--proto", "tcp"), t, g, to); return p + "\n"
+        if a[:2] == ["port", "del"]:
+            if a[2] not in self.tports:
+                raise L(f"no tenant port {a[2]}")
+            del self.tports[a[2]]; return "released\n"
+        if a[:2] == ["port", "list"]:
+            rows = ["PORT   PROTO TENANT           TARGET           ADDRESS          TO"]
+            rows += [f"{p} {pr} {t} {g} {self.target_addr(t, g) or '-'} {to}" for p, (pr, t, g, to) in self.tports.items()
+                     if len(a) < 3 or a[2] == t]
+            return "\n".join(rows) + "\n"
+        if a[0] == "fips":
+            rows = ["FLOATING         TENANT           TARGET           ADDRESS"]
+            for f, (t, g) in self.fips.items():
+                if len(a) < 2 or a[1] == t:
+                    rows.append(f"{f} {t} {g} {'-' if g == '-' else self.target_addr(t, g)}")
+            if len(a) < 2:
+                rows += [f"{f} - - -" for f in self.pool if f not in self.fips]
+            return "\n".join(rows) + "\n"
+        if a[:2] == ["fip", "alloc"]:
+            free = [f for f in self.pool if f not in self.fips]
+            if not free:
+                raise L("the floating IP pool is used up")
+            self.fips[free[0]] = (a[2], "-"); return free[0] + "\n"
+        if a[:2] == ["fip", "assoc"]:
+            if a[2] not in self.fips:
+                raise L(f"no floating IP {a[2]}")
+            t = self.fips[a[2]][0]
+            addr = self.target_addr(t, a[3])
+            if not addr:
+                raise L(f"{a[3]} is not a guest or address of tenant {t} (hubctl ips {t})")
+            for f, (ot, og) in self.fips.items():
+                if f != a[2] and og != "-" and self.target_addr(ot, og) == addr:
+                    raise L(f"{a[3]} ({addr}) already has floating IP {f}")
+            self.fips[a[2]] = (t, a[3]); return f"{a[2]} -> {a[3]} ({addr})\n"
+        if a[:2] == ["fip", "dissoc"]:
+            if a[2] not in self.fips:
+                raise L(f"no floating IP {a[2]}")
+            self.fips[a[2]] = (self.fips[a[2]][0], "-"); return "detached\n"
+        if a[:2] == ["fip", "release"]:
+            if a[2] not in self.fips:
+                raise L(f"no floating IP {a[2]}")
+            del self.fips[a[2]]; return "back in the pool\n"
+        return None
+
     def hubctl(self, a):
+        if a and a[0] in ("ip", "port", "fip", "fips"):
+            out = self.network(a)
+            if out is not None:
+                return out
         if a == ["nodes"]:
             rows = ["NAME     IP             MAC               STATUS    GUESTS RAM FREE/TOTAL",
                     "hub      10.20.0.2      52:54:00:20:00:02 Ready     0      1465/1977 MB"]
@@ -66,7 +162,7 @@ class FakeHub:
             import base64, hashlib
             t, k = a[2], " ".join(a[3:])
             p = k.split()
-            fp = "SHA256:" + base64.b64encode(hashlib.sha256(p[1].encode()).digest()).decode().rstrip("=")
+            fp = "SHA256:" + base64.b64encode(hashlib.sha256(base64.b64decode(p[1] + "=" * (-len(p[1]) % 4))).digest()).decode().rstrip("=")
             if any(x[0] == fp for x in self.keys.get(t, [])):
                 raise labhub.LabError(f"key {fp} is already registered for {t}")
             self.keys.setdefault(t, []).append((fp, "ED25519" if p[0] == "ssh-ed25519" else "RSA",
@@ -109,7 +205,7 @@ class FakeHub:
         if a[:2] == ["vm", "del"]:
             if a[2] not in self.vms:
                 raise labhub.LabError(f"no guest {a[2]}")
-            del self.vms[a[2]]; return ""
+            del self.vms[a[2]]; self.prune(); return ""
         if a[:2] in (["vm", "start"], ["vm", "stop"], ["vm", "reboot"]):
             if a[2] not in self.vms:
                 raise labhub.LabError(f"no guest {a[2]}")
@@ -130,6 +226,9 @@ class FakeHub:
                 for n, v in self.vms.items():
                     if v["tenant"] == t:
                         rows.append(f"{t:16} {sn:18} {v['ip']:16} {v['mac']:17} {n}")
+                for ip, (et, note) in self.extips.items():
+                    if et == t:
+                        rows.append(f"{t:16} {sn:18} {ip:16} {'-':17} (extra{':' + note if note != '-' else ''})")
                 rows.append(f"{t:16} {sn:18} {'10.x.next':16} {'':17} <- next free")
             return "\n".join(rows) + "\n"
         if a[:1] == ["exec"]:

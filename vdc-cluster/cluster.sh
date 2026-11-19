@@ -671,13 +671,18 @@ EOF
 #   JUMP_PORT (45222)             -> hub:45222        tenant jump host
 #   WEBCONSOLE_PORTS (45300-45399)-> hub, same port   ttyd web consoles
 #   one of VM_SSH_PORTS per guest -> <guest>:22       given by the hub (hubctl ports)
+#   tenant ports (TENANT_PORTS)   -> <target>:<port>  booked by tenants (hubctl port list)
+# Floating IPs (FLOATING_POOL, hubctl fips) are 1:1 NAT: each attached one is added to the campus
+# NIC, everything sent to it goes to its target, and the target's own traffic, which the hub
+# sends back through this PC, leaves from it.
 # It also routes the tenant subnets via the hub, so staff on this PC reach every guest.
-# The rules live in two chains of our own, VDC-EDGE (nat) and VDC-EDGE-FWD (filter), rebuilt
-# by 'edge sync' after every guest change.
+# The rules live in chains of our own, VDC-EDGE and VDC-FIP / VDC-FIP-POST (nat) and
+# VDC-EDGE-FWD (filter), rebuilt by 'edge sync' after every guest or network change.
 EDGE_RT_PROTO=222          # our routes carry "proto 222" (ip route show proto 222)
 : "${JUMP_PORT:=45222}" "${WEBCONSOLE_PORTS:=45300-45399}" "${EDGE_ALLOW:=0.0.0.0/0}"
 EDGE_HUB_SSH=${EDGE_HUB_SSH-45022}
 VM_SSH_PORTS=${VM_SSH_PORTS-46000-46999}
+TENANT_PORTS=${TENANT_PORTS-47000-47999}
 edge_if() {
   if [ -n "${EDGE_IF:-}" ]; then echo "$EDGE_IF"; return; fi
   ip -4 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}'
@@ -694,11 +699,39 @@ edge_clear() {
   local t r
   command -v iptables >/dev/null || return 0
   for t in nat filter; do
-    iptables -t "$t" -S 2>/dev/null | grep -- '--comment vdc-edge' | sed 's/^-A /-D /' |
+    iptables -t "$t" -S 2>/dev/null | { grep -- '--comment vdc-edge' || true; } | sed 's/^-A /-D /' |
       while read -r r; do eval "iptables -t $t $r" 2>/dev/null || true; done
   done
-  iptables -t nat -F VDC-EDGE 2>/dev/null && iptables -t nat -X VDC-EDGE 2>/dev/null || true
+  for c in VDC-EDGE VDC-FIP VDC-FIP-POST; do
+    iptables -t nat -F "$c" 2>/dev/null && iptables -t nat -X "$c" 2>/dev/null || true
+  done
   iptables -t filter -F VDC-EDGE-FWD 2>/dev/null && iptables -t filter -X VDC-EDGE-FWD 2>/dev/null || true
+  edge_fip_addrs ""
+}
+# the floating IPs this PC holds on its campus NIC, kept in state/edge.fips ("NIC ADDRESS")
+edge_fip_addrs() {   # "ADDRESS ..." wanted on the campus NIC (empty: none); others are removed
+  local want=" $1 " nic a i
+  if [ -f "$ST/edge.fips" ]; then
+    while read -r nic a; do
+      [ -n "$a" ] || continue
+      case $want in *" $a "*) [ "$nic" = "$(edge_if)" ] && continue ;; esac
+      step "edge: floating IP $a off $nic"
+      ip -4 addr del "$a/32" dev "$nic" 2>/dev/null || true
+    done <"$ST/edge.fips"
+  fi
+  : >"$ST/edge.fips.tmp"
+  i=$(edge_if || true)
+  for a in $1; do
+    [ -n "$i" ] || break
+    if ! ip -4 -o addr show dev "$i" | grep -q " $a/32 "; then
+      step "edge: floating IP $a on $i"
+      ip -4 addr add "$a/32" dev "$i"
+      # tell the campus switch and router where the address is now (best effort)
+      if command -v arping >/dev/null; then (arping -q -U -c 2 -I "$i" "$a" >/dev/null 2>&1 &); fi
+    fi
+    echo "$i $a" >>"$ST/edge.fips.tmp"
+  done
+  mv "$ST/edge.fips.tmp" "$ST/edge.fips"
 }
 edge_forward_restore() {
   if [ -f "$ST/edge.ip_forward" ]; then
@@ -727,8 +760,16 @@ edge_guest_ports() {   # "PORT ADDRESS GUEST" per guest, from the hub
   [ -n "$VM_SSH_PORTS" ] || return 0
   hub hubctl ports 2>/dev/null | awk 'NR > 1 && $4 ~ /^[0-9]+$/ && $3 ~ /^[0-9.]+$/ {print $4, $3, $1}'
 }
-edge_rules() {   # CAMPUS_IF: (re)write the two chains; the jumps into them are added by 'edge up'
-  local i=$1 n=0 port addr guest
+edge_tenant_ports() {   # "PORT PROTO ADDRESS TO TENANT" per tenant port, from the hub
+  [ -n "$TENANT_PORTS" ] || return 0
+  hub hubctl port list 2>/dev/null |
+    awk 'NR > 1 && $1 ~ /^[0-9]+$/ && $5 ~ /^[0-9.]+$/ && $6 ~ /^[0-9]+$/ {print $1, $2, $5, $6, $3}'
+}
+edge_fips() {   # "FLOATING TENANT ADDRESS" per attached floating IP, from the hub
+  hub hubctl fips 2>/dev/null | awk 'NR > 1 && $2 != "-" && $4 ~ /^[0-9.]+$/ {print $1, $2, $4}'
+}
+edge_rules() {   # CAMPUS_IF: (re)write our chains; the jumps into them are added by 'edge up'
+  local i=$1 n=0 nt=0 nf=0 port addr guest proto to tenant fip fipl=
   iptables -t nat -N VDC-EDGE 2>/dev/null || iptables -t nat -F VDC-EDGE
   iptables -t filter -N VDC-EDGE-FWD 2>/dev/null || iptables -t filter -F VDC-EDGE-FWD
   # what was forwarded may pass, and its answers may come back (ctstate DNAT: both directions)
@@ -747,7 +788,28 @@ edge_rules() {   # CAMPUS_IF: (re)write the two chains; the jumps into them are 
       -j DNAT --to-destination "$addr:22"
     n=$((n + 1))
   done < <(edge_guest_ports)
-  echo "$n"
+  while read -r port proto addr to tenant; do
+    [ -n "$port" ] || continue
+    iptables -t nat -A VDC-EDGE -p "$proto" --dport "$port" -m comment --comment "port $tenant" \
+      -j DNAT --to-destination "$addr:$to"
+    nt=$((nt + 1))
+  done < <(edge_tenant_ports)
+  # floating IPs: in through VDC-FIP (DNAT, no SNAT to this PC: the guest sees the real client);
+  # out through VDC-FIP-POST (SNAT to the floating IP); forwarding both ways
+  iptables -t nat -N VDC-FIP 2>/dev/null || iptables -t nat -F VDC-FIP
+  iptables -t nat -N VDC-FIP-POST 2>/dev/null || iptables -t nat -F VDC-FIP-POST
+  while read -r fip tenant addr; do
+    [ -n "$fip" ] || continue
+    iptables -t nat -A VDC-FIP -d "$fip" -m comment --comment "fip $tenant" -j DNAT --to-destination "$addr"
+    iptables -t nat -A VDC-FIP-POST -o "$UNDERLAY_BR" -m conntrack --ctstate DNAT --ctorigdst "$fip" -j ACCEPT
+    iptables -t nat -A VDC-FIP-POST -o "$i" -s "$addr" -j SNAT --to-source "$fip"
+    iptables -t filter -A VDC-EDGE-FWD -i "$UNDERLAY_BR" -o "$i" -s "$addr" -j ACCEPT
+    iptables -t filter -A VDC-EDGE-FWD -i "$i" -o "$UNDERLAY_BR" -d "$addr" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    fipl="$fipl $fip"
+    nf=$((nf + 1))
+  done < <(edge_fips)
+  edge_fip_addrs "$fipl"
+  echo "$n $nt $nf"
 }
 
 cmd_edge() {
@@ -771,16 +833,22 @@ cmd_edge() {
       # the one kernel setting the edge changes: remembered, and restored by 'edge down'
       [ -f "$ST/edge.ip_forward" ] || cat /proc/sys/net/ipv4/ip_forward >"$ST/edge.ip_forward"
       sysctl -qw net.ipv4.ip_forward=1
+      a=$(edge_addr || true)   # before edge_rules: it adds the floating IPs to the same NIC
       n=$(edge_rules "$i")
       # only connections from EDGE_ALLOW to this PC's own address enter VDC-EDGE
-      a=$(edge_addr || true)
       edge_ipt nat PREROUTING -i "$i" ${a:+-d "$a"} -s "$EDGE_ALLOW" -m comment --comment vdc-edge -j VDC-EDGE
+      # and to the floating IPs: VDC-FIP
+      edge_ipt nat PREROUTING -i "$i" -s "$EDGE_ALLOW" -m comment --comment vdc-edge -j VDC-FIP
       # from the lab's view the connection comes from this PC (LABPC_IP), so replies return here
       edge_ipt nat POSTROUTING -o "$UNDERLAY_BR" -m conntrack --ctstate DNAT -m comment --comment vdc-edge -j SNAT --to-source "$LABPC_IP"
+      # ... except for floating IPs (VDC-FIP-POST first: it ACCEPTs those before that SNAT)
+      iptables -t nat -D POSTROUTING -m comment --comment vdc-edge -j VDC-FIP-POST 2>/dev/null || true
+      iptables -t nat -I POSTROUTING 1 -m comment --comment vdc-edge -j VDC-FIP-POST
       edge_ipt filter FORWARD -m comment --comment vdc-edge -j VDC-EDGE-FWD
       if [ "$1" = up ]; then
+        set -- $n
         echo "edge up: ${a:-<this PC>} forwards hub SSH :${EDGE_HUB_SSH:--}, jump host :$JUMP_PORT," \
-             "consoles :$WEBCONSOLE_PORTS, $n guest SSH port(s); from $EDGE_ALLOW"
+             "consoles :$WEBCONSOLE_PORTS, $1 guest SSH port(s), $2 tenant port(s), $3 floating IP(s); from $EDGE_ALLOW"
       fi ;;
     down)
       edge_clear
@@ -796,7 +864,12 @@ cmd_edge() {
         echo "consoles    ${a:-<this PC>}:$WEBCONSOLE_PORTS -> $HUB_IP (hubctl consoles)"
         iptables -t nat -S VDC-EDGE 2>/dev/null | awk -v a="${a:-<this PC>}" '
           /--comment "?guest / {for (k = 1; k <= NF; k++) {if ($k == "--dport") p = $(k + 1); if ($k ~ /^"?guest$/) g = $(k + 1); if ($k == "--to-destination") d = $(k + 1)}
-            gsub(/"/, "", g); printf "guest ssh   %-14s ssh -p %s <user>@%s   -> %s\n", g, p, a, d}'
+            gsub(/"/, "", g); printf "guest ssh   %-14s ssh -p %s <user>@%s   -> %s\n", g, p, a, d}
+          /--comment "?port / {for (k = 1; k <= NF; k++) {if ($k == "--dport") p = $(k + 1); if ($k == "-p") pr = $(k + 1); if ($k ~ /^"?port$/) t = $(k + 1); if ($k == "--to-destination") d = $(k + 1)}
+            gsub(/"/, "", t); printf "tenant port %-14s %s:%s/%s   -> %s\n", t, a, p, pr, d}'
+        iptables -t nat -S VDC-FIP 2>/dev/null | awk '
+          /--comment "?fip / {for (k = 1; k <= NF; k++) {if ($k == "-d") f = $(k + 1); if ($k ~ /^"?fip$/) t = $(k + 1); if ($k == "--to-destination") d = $(k + 1)}
+            gsub(/"/, "", t); sub(/\/32$/, "", f); printf "floating ip %-14s %s   <-> %s\n", t, f, d}'
       else
         echo "forwards    off (./cluster.sh edge up)"
       fi
@@ -1169,7 +1242,10 @@ case ${1:-help} in
   ssh) need_root; [ -n "${2:-}" ] || die "usage: $0 ssh NAME [CMD]"
     ip=$(node_ip "$2") || die "unknown node $2"; shift 2; lab_ssh_t "$ip" "$@" ;;
   hubctl) need_root; shift; rc=0; lab_ssh_t "$HUB_IP" hubctl "$@" || rc=$?
-    case "${1:-} ${2:-}" in "tenant add"|"tenant del"|"vm add"|"vm del") cmd_edge sync >/dev/null || true ;; esac
+    case "${1:-} ${2:-}" in
+      "tenant add"|"tenant del"|"vm add"|"vm del"|"ip del"|"port add"|"port del"|"fip assoc"|"fip dissoc"|"fip release")
+        cmd_edge sync >/dev/null || true ;;
+    esac
     if [ "${1:-} ${2:-}" = "vm add" ] && [ "$rc" = 0 ] && edge_on; then   # the real campus address
       cmd_edge status | awk -v g="${3:-}" '$1 == "guest" && $3 == g {sub(/^guest ssh +[^ ]+ +/, ""); print "forwarded:  " $0}'
     fi

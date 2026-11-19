@@ -59,3 +59,7 @@ TUNNEL_PROTOCOL = os.environ.get("VDC_TUNNEL_PROTOCOL", "auto")
 TUNNEL_WAIT = int(os.environ.get("VDC_TUNNEL_WAIT", "40"))        # seconds to wait for the public URL
 API_PORT = int(os.environ.get("VDC_API_PORT", "36100"))
 DEFAULT_QUOTA["max_tunnels"] = TUNNELS_PER_TENANT
+# extra addresses, campus ports and floating IPs a new tenant may have (the provider can change it)
+DEFAULT_QUOTA["max_ips"] = int(os.environ.get("VDC_IPS_PER_TENANT", "2"))
+DEFAULT_QUOTA["max_ports"] = int(os.environ.get("VDC_PORTS_PER_TENANT", "5"))
+DEFAULT_QUOTA["max_floating_ips"] = int(os.environ.get("VDC_FLOATING_IPS_PER_TENANT", "1"))

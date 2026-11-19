@@ -12,7 +12,24 @@
 #   hubctl tenant set NAME internet on|off   guests reach the internet (NAT) or not
 #   hubctl tenant del NAME
 #   hubctl tenants
-#   hubctl ips [TENANT]                  address allocations
+#   hubctl ips [TENANT]                  address allocations (guests and extra addresses)
+#
+#   hubctl ip add TENANT [ADDR] [--note WORD]   extra address of the tenant subnet, given to no guest:
+#                                        a service address (MetalLB, keepalived) or a guest's second one
+#   hubctl ip del ADDR                   (its ports and floating IP go with it)
+#
+#   hubctl port add TENANT TARGET PORT [--proto tcp|udp] [--at CAMPUS_PORT]
+#                                        TARGET (guest or address of the tenant) :PORT on a campus port
+#                                        of the main PC, from TENANT_PORTS -> prints that port
+#   hubctl port del CAMPUS_PORT
+#   hubctl port list [TENANT]
+#
+#   hubctl fip alloc TENANT [ADDR]       book a floating IP (FLOATING_POOL) for the tenant -> prints it
+#   hubctl fip assoc FIP TARGET          attach it to a guest or address of the tenant: every port, and
+#                                        the target's own traffic leaves from it (1:1 NAT on the main PC)
+#   hubctl fip dissoc FIP                detach it (stays booked for the tenant)
+#   hubctl fip release FIP               give it back to the pool
+#   hubctl fips [TENANT]                 the pool: booked, attached, free
 #
 #   hubctl key add TENANT 'ssh-ed25519 AAAA... comment'   tenant SSH key: jump host + new guests
 #   hubctl key del TENANT FINGERPRINT
@@ -56,6 +73,11 @@ VMS=$S/vms                # GUEST TENANT NODE IMAGE IP MEM MAC CPUS
 PORTS=$S/ports            # GUEST PORT: the guest's SSH on the main PC's campus address
 POWER=$S/power            # GUEST off: stopped on purpose (hubctl vm stop); every other guest should run
 VM_SSH_PORTS=${VM_SSH_PORTS-46000-46999}   # empty = no per-guest SSH ports
+EXTIPS=$S/extips          # ADDR TENANT NOTE: extra addresses of a tenant subnet (no guest, no DHCP)
+TPORTS=$S/tports          # PORT PROTO TENANT TARGET TO: campus PORT of the main PC -> TARGET:TO
+FIPS=$S/fips              # FIP TENANT TARGET: booked floating IPs (TARGET - = not attached)
+TENANT_PORTS=${TENANT_PORTS-47000-47999}   # empty = no tenant ports
+FIP_TABLE=222             # routing table: attached targets leave through the main PC
 IMAGES=$S/images          # NAME TYPE MEM DISK USER SHA256 SIZE_MB
 IMGDIR=$S/www/images      # served to the nodes as http://hub:API_PORT/images/NAME.qcow2
 CAPS=$S/caps              # <node>: "MEM_MB CPUS" reported by the agent
@@ -95,7 +117,7 @@ cmd_init() {
   [ ! -x "$LAB_TRACE" ] || "$LAB_TRACE" --install "$TRACE_BIN" >/dev/null 2>&1 || true
   install -d -m 755 "$S" "$S/www" "$IMGDIR" "$S/www/cgi-bin"
   install -d -m 700 "$S/seen" "$CAPS"
-  for f in nodes tenants vms images known_hosts; do [ -e "$S/$f" ] || : >"$S/$f"; done
+  for f in nodes tenants vms images known_hosts extips tports fips; do [ -e "$S/$f" ] || : >"$S/$f"; done
   t=$(smbios_get lab.token)            # lab PC may impose the token
   if [ -n "$t" ]; then
     printf '%s\n' "$t" >"$TOKEN_F"
@@ -152,7 +174,9 @@ cmd_apply() {
   done
   jump_sync
   ports_sync
+  net_prune
   guest_dhcp
+  fip_route
   fw_apply
 }
 
@@ -281,13 +305,23 @@ jump_sync() {
 # the hub firewall, written from the registries: tenant router (NAT out, tenants apart,
 # tenants away from the underlay and the hub's services), jump host, web console ports
 fw_rules() {
-  _nets="" _out=""
+  _nets="" _out="" _fin="" _fout=""
   while read -r _t _v _s _i; do
     [ -n "$_t" ] || continue
     _s=${_s:-192.168.$_v.0/24}
     _nets="$_nets${_nets:+, }$_s"
     [ "${_i:-on}" = off ] || _out="$_out${_out:+, }$_s"
   done <"$TENANTS"
+  # targets of attached floating IPs: reachable from campus; with internet on, they leave from it
+  _fl=$(fip_targets)
+  while read -r _ft _fa; do
+    [ -n "$_fa" ] || continue
+    _fin="$_fin${_fin:+, }$_fa"
+    [ "$(tenant_internet "$_ft")" = off ] || _fout="$_fout${_fout:+, }$_fa"
+  done <<EOF_FIP
+$_fl
+EOF_FIP
+  _under=$UNDERLAY_NET/$UNDERLAY_PREFIX _uif=${HUB_UNDERLAY_IF:-eth1}
   cat <<NFT
 #!/usr/sbin/nft -f
 # vdc-cluster hub firewall - written by hubctl from $TENANTS (do not edit: hubctl apply)
@@ -305,6 +339,8 @@ delete table inet lab_fw
 table inet lab_fw {
   set tenants { type ipv4_addr; flags interval;${_nets:+ elements = { $_nets \};} }
   set internet { type ipv4_addr; flags interval;${_out:+ elements = { $_out \};} }
+  set fip_in { type ipv4_addr;${_fin:+ elements = { $_fin \};} }
+  set fip_out { type ipv4_addr;${_fout:+ elements = { $_fout \};} }
 
   chain input {
     type filter hook input priority filter; policy accept;
@@ -321,8 +357,10 @@ table inet lab_fw {
     ct state established,related accept
     ip saddr @tenants ip daddr @tenants drop
     ip saddr @internet oifname "$HUB_UPLINK_IF" accept
+    ip saddr @fip_out oifname "$_uif" ip daddr != $_under accept
     ip saddr @tenants drop
     ip daddr @tenants ip saddr $LABPC_IP accept
+    ip daddr @fip_in iifname "$_uif" ip saddr != $_under accept
     ip daddr @tenants drop
   }
 
@@ -521,7 +559,10 @@ subnet_range() {   # CIDR -> "FIRST LAST" as integers
   echo "$((_net + _off)) $((_net + _size - 2))"
 }
 
-ip_in_use() { awk -v t="$1" -v a="$2" '$2==t && $5==a {f=1} END {exit !f}' "$VMS"; }
+ip_in_use() {   # TENANT ADDR: a guest's or an extra address
+  awk -v t="$1" -v a="$2" '$2==t && $5==a {f=1} END {exit !f}' "$VMS" ||
+    awk -v t="$1" -v a="$2" '$2==t && $1==a {f=1} END {exit !f}' "$EXTIPS" 2>/dev/null
+}
 
 ip_alloc() {   # TENANT -> next free address (lowest first)
   _c=$(tenant_subnet "$1")
@@ -536,14 +577,14 @@ ip_alloc() {   # TENANT -> next free address (lowest first)
   return 1
 }
 
-ip_check() {   # TENANT ADDR -> ok if inside the allocatable range and free
-  _c=$(tenant_subnet "$1")
-  is_ip4 "$2" || die "--ip: $2 is not an IPv4 address"
+ip_check() {   # TENANT ADDR [LABEL] -> ok if inside the allocatable range and free
+  _c=$(tenant_subnet "$1") _lbl=${3:---ip}
+  is_ip4 "$2" || die "$_lbl: $2 is not an IPv4 address"
   # shellcheck disable=SC2046   # two numbers -> two parameters
   set -- "$1" "$2" $(subnet_range "$_c")
   _i=$(ip2int "$2")
-  [ "$_i" -ge "$3" ] && [ "$_i" -le "$4" ] || die "--ip: $2 is outside the allocatable range $(int2ip "$3") - $(int2ip "$4") of $_c"
-  if ip_in_use "$1" "$2"; then die "--ip: $2 is already used in tenant $1"; fi
+  [ "$_i" -ge "$3" ] && [ "$_i" -le "$4" ] || die "$_lbl: $2 is outside the allocatable range $(int2ip "$3") - $(int2ip "$4") of $_c"
+  if ip_in_use "$1" "$2"; then die "$_lbl: $2 is already used in tenant $1"; fi
 }
 
 cmd_tenant() {
@@ -613,11 +654,280 @@ cmd_ips() {   # [TENANT]
     [ -n "$t" ] || continue
     if [ -n "${1:-}" ] && [ "$1" != "$t" ]; then continue; fi
     sn=$(tenant_subnet "$t")
-    awk -v t="$t" -v s="$sn" '$2==t {printf "%-16s %-18s %-16s %-17s %s\n", t, s, $5, $7, $1}' "$VMS" |
-      sort -t. -k4,4n
+    { awk -v t="$t" -v s="$sn" '$2==t {printf "%-16s %-18s %-16s %-17s %s\n", t, s, $5, $7, $1}' "$VMS"
+      awk -v t="$t" -v s="$sn" '$2==t {printf "%-16s %-18s %-16s %-17s %s\n", t, s, $1, "-", "(extra" ($3 != "-" ? ":" $3 : "") ")"}' \
+        "$EXTIPS" 2>/dev/null; } | sort -t. -k4,4n
     nxt=$(ip_alloc "$t" || echo "(subnet full)")
     printf '%-16s %-18s %-16s %-17s %s\n' "$t" "$sn" "$nxt" "" "<- next free"
   done <"$TENANTS"
+}
+
+# ---------------------------------------------------------------- extra addresses, tenant ports, floating IPs
+# An extra address comes from the tenant's allocatable range like a guest's, but belongs to no
+# guest (dnsmasq hands out reserved addresses only, so no one gets it by DHCP): a service address
+# that MetalLB or keepalived announces, or a second address set inside a guest.
+# Tenant ports and floating IPs point at a TARGET of the tenant: a guest (by name) or one of the
+# tenant's addresses (a guest's or an extra one). cluster.sh edge on the main PC forwards them.
+# A floating IP is 1:1 NAT on the main PC; its target's traffic goes back through the main PC
+# (routing table FIP_TABLE here), so replies and the target's own connections leave from it.
+is_note() { printf '%s' "$1" | grep -Eq '^[a-z0-9._-]{1,32}$'; }
+is_port() { is_num "$1" && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+in_range() { [ -n "$2" ] && [ "$1" -ge "${2%-*}" ] && [ "$1" -le "${2#*-}" ]; }   # N LO-HI
+
+target_addr() {   # TENANT TARGET -> its address; nothing if not a guest or address of that tenant
+  if is_ip4 "$2"; then
+    awk -v t="$1" -v a="$2" '$2==t && $5==a {print a; exit}' "$VMS"
+    awk -v t="$1" -v a="$2" '$2==t && $1==a {print a; exit}' "$EXTIPS" 2>/dev/null
+  else
+    awk -v t="$1" -v g="$2" '$1==g && $2==t {print $5; exit}' "$VMS"
+  fi | head -n 1
+}
+
+fip_targets() {   # "TENANT ADDRESS" of every attached floating IP
+  [ -e "$FIPS" ] || return 0
+  awk '$3 != "-" {print $2, $3}' "$FIPS" | while read -r _ft _fg; do
+    _fa=$(target_addr "$_ft" "$_fg")
+    [ -z "$_fa" ] || echo "$_ft $_fa"
+  done
+}
+
+pool_addrs() {   # FLOATING_POOL "A-B,C ..." -> one address per line
+  printf '%s\n' "${FLOATING_POOL:-}" | tr ', ' '\n\n' | while read -r _r; do
+    [ -n "$_r" ] || continue
+    _lo=${_r%-*} _hi=${_r#*-}
+    if ! is_ip4 "$_lo" || ! is_ip4 "$_hi"; then echo "warning: FLOATING_POOL: bad entry $_r" >&2; continue; fi
+    _i=$(ip2int "$_lo") _e=$(ip2int "$_hi")
+    if [ $((_e - _i)) -gt 1024 ]; then echo "warning: FLOATING_POOL: $_r has over 1024 addresses" >&2; continue; fi
+    while [ "$_i" -le "$_e" ]; do int2ip "$_i"; _i=$((_i + 1)); done
+  done
+}
+
+# drop what points at a tenant, guest or address that is gone (under the lock)
+net_prune() {
+  for _f in "$EXTIPS" "$TPORTS" "$FIPS"; do [ -e "$_f" ] || : >"$_f"; done
+  awk 'FILENAME == ARGV[1] {t[$1] = 1; next} ($2 in t)' "$TENANTS" "$EXTIPS" >"$EXTIPS.tmp"
+  mv "$EXTIPS.tmp" "$EXTIPS"
+  : >"$TPORTS.tmp"
+  while read -r _p _pr _t _g _to; do
+    [ -n "$_p" ] || continue
+    if [ -n "$TENANT_PORTS" ] && [ -n "$(target_addr "$_t" "$_g")" ]; then
+      echo "$_p $_pr $_t $_g $_to" >>"$TPORTS.tmp"
+    else
+      logf "port $_p released: $_t $_g is gone"
+    fi
+  done <"$TPORTS"
+  mv "$TPORTS.tmp" "$TPORTS"
+  : >"$FIPS.tmp"
+  while read -r _a _t _g; do
+    [ -n "$_a" ] || continue
+    if ! has "$TENANTS" "$_t"; then logf "fip $_a back in the pool: tenant $_t is gone"; continue; fi
+    if [ "$_g" != - ] && [ -z "$(target_addr "$_t" "$_g")" ]; then logf "fip $_a detached: $_g is gone"; _g=-; fi
+    echo "$_a $_t $_g" >>"$FIPS.tmp"
+  done <"$FIPS"
+  mv "$FIPS.tmp" "$FIPS"
+  chmod 644 "$EXTIPS" "$TPORTS" "$FIPS"
+}
+
+# the hub's half of a floating IP: its target's traffic leaves through the main PC, which
+# translates it to the floating IP (one "ip rule" per target, table FIP_TABLE)
+fip_route() {
+  _want=$(fip_targets | awk '{print $2}' | sort -u | tr '\n' ' ')
+  _have=$(ip -4 rule show 2>/dev/null | awk -v t="$FIP_TABLE" '$2 == "from" && $NF == t {print $3}' | sort -u | tr '\n' ' ')
+  for _a in $_want; do
+    case " $_have " in *" $_a "*) ;; *)
+      step "floating IP target $_a: its traffic goes through the main PC $LABPC_IP"
+      ip rule add from "$_a" lookup "$FIP_TABLE" priority 1222 ;;
+    esac
+  done
+  for _a in $_have; do
+    case " $_want " in *" $_a "*) ;; *)
+      step "floating IP target $_a: detached"
+      ip rule del from "$_a" lookup "$FIP_TABLE" priority 1222 2>/dev/null || true ;;
+    esac
+  done
+  [ -n "$_want" ] || return 0
+  _uif=${HUB_UNDERLAY_IF:-eth1}
+  if ! ip -4 route show table "$FIP_TABLE" 2>/dev/null | grep -q "^default via $LABPC_IP "; then
+    step "routing table $FIP_TABLE: default via the main PC"
+    ip route replace default via "$LABPC_IP" dev "$_uif" table "$FIP_TABLE"
+  fi
+  # campus sources arrive on the underlay, but the hub's own route to them is the uplink
+  if [ "$(sysctl -n "net.ipv4.conf.$_uif.rp_filter" 2>/dev/null)" != 2 ]; then
+    step "loose reverse-path filter on $_uif (floating IP traffic from campus)"
+    sysctl -qw "net.ipv4.conf.$_uif.rp_filter=2"
+  fi
+}
+
+cmd_ip() {
+  case ${1:-} in
+    add)
+      shift
+      [ $# -ge 1 ] || die "usage: hubctl ip add TENANT [ADDR] [--note WORD]"
+      t=$1 a="" note=-; shift
+      while [ $# -gt 0 ]; do
+        case $1 in
+          --note) note=${2:?}; shift ;;
+          -*) die "ip add: unknown option $1" ;;
+          *) a=$1 ;;
+        esac
+        shift
+      done
+      has "$TENANTS" "$t" || die "no tenant $t"
+      [ "$note" = - ] || is_note "$note" || die "--note: one word of a-z 0-9 . _ - (max 32)"
+      lock
+      if [ -n "$a" ]; then ip_check "$t" "$a" ADDR; else a=$(ip_alloc "$t") || die "tenant $t: no free address in $(tenant_subnet "$t")"; fi
+      echo "$a $t $note" >>"$EXTIPS"; chmod 644 "$EXTIPS"
+      logf "ip add: $a tenant=$t note=$note"
+      echo "$a" ;;
+    del)
+      [ $# -eq 2 ] || die "usage: hubctl ip del ADDR"
+      t=$(field "$EXTIPS" "$2" 2)
+      [ -n "$t" ] || die "no extra address $2 (hubctl ips)"
+      lock
+      del_line "$EXTIPS" "$2"
+      net_prune
+      fip_route
+      fw_apply
+      logf "ip del: $2 tenant=$t"
+      echo "$2 released" ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+tport_alloc() {
+  _p=${TENANT_PORTS%-*}
+  while [ "$_p" -le "${TENANT_PORTS#*-}" ]; do
+    has "$TPORTS" "$_p" || { echo "$_p"; return 0; }
+    _p=$((_p + 1))
+  done
+  return 1
+}
+
+cmd_port() {
+  case ${1:-} in
+    add)
+      shift
+      [ $# -ge 3 ] || die "usage: hubctl port add TENANT TARGET PORT [--proto tcp|udp] [--at CAMPUS_PORT]"
+      [ -n "$TENANT_PORTS" ] || die "tenant ports are off (TENANT_PORTS is empty in cluster.conf)"
+      t=$1 g=$2 to=$3 pr=tcp at=""; shift 3
+      while [ $# -gt 0 ]; do
+        case $1 in
+          --proto) pr=${2:?}; shift ;;
+          --at) at=${2:?}; shift ;;
+          *) die "port add: unexpected '$1'" ;;
+        esac
+        shift
+      done
+      has "$TENANTS" "$t" || die "no tenant $t"
+      is_port "$to" || die "PORT: 1-65535"
+      case $pr in tcp|udp) ;; *) die "--proto: tcp or udp" ;; esac
+      is_ip4 "$g" || is_tname "$g" || die "TARGET: a guest name or an address"
+      [ -n "$(target_addr "$t" "$g")" ] || die "$g is not a guest or address of tenant $t (hubctl ips $t)"
+      lock
+      if awk -v t="$t" -v g="$g" -v to="$to" -v pr="$pr" '$3==t && $4==g && $5==to && $2==pr {f=1} END {exit !f}' "$TPORTS"; then
+        die "$g:$to/$pr already has a campus port (hubctl port list $t)"
+      fi
+      if [ -n "$at" ]; then
+        is_port "$at" && in_range "$at" "$TENANT_PORTS" || die "--at: one of TENANT_PORTS ($TENANT_PORTS)"
+        if has "$TPORTS" "$at"; then die "campus port $at is taken"; fi
+      else
+        at=$(tport_alloc) || die "no free campus port in $TENANT_PORTS"
+      fi
+      echo "$at $pr $t $g $to" >>"$TPORTS"; chmod 644 "$TPORTS"
+      logf "port add: $at/$pr -> $t $g:$to"
+      echo "$at" ;;
+    del)
+      [ $# -eq 2 ] || die "usage: hubctl port del CAMPUS_PORT"
+      has "$TPORTS" "$2" || die "no tenant port $2"
+      lock
+      del_line "$TPORTS" "$2"
+      logf "port del: $2"
+      echo "campus port $2 released" ;;
+    list|"")
+      [ $# -eq 0 ] || shift
+      printf '%-6s %-5s %-16s %-16s %-16s %s\n' PORT PROTO TENANT TARGET ADDRESS TO
+      [ -e "$TPORTS" ] || return 0
+      while read -r p pr t g to; do
+        [ -n "$p" ] || continue
+        if [ -n "${1:-}" ] && [ "$1" != "$t" ]; then continue; fi
+        a=$(target_addr "$t" "$g")
+        printf '%-6s %-5s %-16s %-16s %-16s %s\n' "$p" "$pr" "$t" "$g" "${a:--}" "$to"
+      done <"$TPORTS" ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+cmd_fip() {
+  case ${1:-} in
+    alloc)
+      [ $# -ge 2 ] && [ $# -le 3 ] || die "usage: hubctl fip alloc TENANT [ADDR]"
+      has "$TENANTS" "$2" || die "no tenant $2"
+      [ -n "${FLOATING_POOL:-}" ] || die "no floating IPs: FLOATING_POOL is empty in cluster.conf"
+      lock
+      pool=$(pool_addrs)
+      if [ -n "${3:-}" ]; then
+        printf '%s\n' "$pool" | grep -qxF "$3" || die "$3 is not in FLOATING_POOL ($FLOATING_POOL)"
+        if has "$FIPS" "$3"; then die "floating IP $3 is booked by tenant $(field "$FIPS" "$3" 2)"; fi
+        a=$3
+      else
+        a=$(printf '%s\n' "$pool" | awk 'FILENAME == ARGV[1] {u[$1] = 1; next} $1 != "" && !($1 in u) {print; exit}' "$FIPS" -)
+        [ -n "$a" ] || die "the floating IP pool is used up ($FLOATING_POOL)"
+      fi
+      echo "$a $2 -" >>"$FIPS"; chmod 644 "$FIPS"
+      logf "fip alloc: $a tenant=$2"
+      echo "$a" ;;
+    assoc)
+      [ $# -eq 3 ] || die "usage: hubctl fip assoc FIP TARGET"
+      t=$(field "$FIPS" "$2" 2)
+      [ -n "$t" ] || die "no floating IP $2 (hubctl fip alloc TENANT)"
+      is_ip4 "$3" || is_tname "$3" || die "TARGET: a guest name or an address"
+      a=$(target_addr "$t" "$3")
+      [ -n "$a" ] || die "$3 is not a guest or address of tenant $t (hubctl ips $t)"
+      lock
+      o=$(awk -v f="$2" '$1 != f && $3 != "-" {print $1, $2, $3}' "$FIPS" | while read -r _of _ot _og; do
+            if [ "$(target_addr "$_ot" "$_og")" = "$a" ]; then echo "$_of"; fi; done | head -n 1)
+      [ -z "$o" ] || die "$3 ($a) already has floating IP $o"
+      awk -v f="$2" -v g="$3" '$1==f {$3=g} {print}' "$FIPS" >"$FIPS.tmp" && mv "$FIPS.tmp" "$FIPS"
+      chmod 644 "$FIPS"
+      fip_route
+      fw_apply
+      logf "fip assoc: $2 -> $t $3 ($a)"
+      echo "$2 -> $3 ($a)" ;;
+    dissoc)
+      [ $# -eq 2 ] || die "usage: hubctl fip dissoc FIP"
+      t=$(field "$FIPS" "$2" 2)
+      [ -n "$t" ] || die "no floating IP $2"
+      lock
+      awk -v f="$2" '$1==f {$3="-"} {print}' "$FIPS" >"$FIPS.tmp" && mv "$FIPS.tmp" "$FIPS"
+      chmod 644 "$FIPS"
+      fip_route
+      fw_apply
+      logf "fip dissoc: $2"
+      echo "$2 detached (still booked for tenant $t)" ;;
+    release)
+      [ $# -eq 2 ] || die "usage: hubctl fip release FIP"
+      t=$(field "$FIPS" "$2" 2)
+      [ -n "$t" ] || die "no floating IP $2"
+      lock
+      del_line "$FIPS" "$2"
+      fip_route
+      fw_apply
+      logf "fip release: $2 tenant=$t"
+      echo "$2 back in the pool" ;;
+    list|"")
+      [ $# -eq 0 ] || shift
+      printf '%-16s %-16s %-16s %s\n' FLOATING TENANT TARGET ADDRESS
+      [ -e "$FIPS" ] || : >"$FIPS"
+      while read -r f t g; do
+        [ -n "$f" ] || continue
+        if [ -n "${1:-}" ] && [ "$1" != "$t" ]; then continue; fi
+        a=-; [ "$g" = - ] || a=$(target_addr "$t" "$g")
+        printf '%-16s %-16s %-16s %s\n' "$f" "$t" "$g" "${a:--}"
+      done <"$FIPS"
+      [ -z "${1:-}" ] || return 0
+      pool_addrs | awk 'FILENAME == ARGV[1] {u[$1] = 1; next} $1 != "" && !($1 in u) {printf "%-16s %-16s %-16s %s\n", $1, "-", "-", "-"}' "$FIPS" - ;;
+    *) usage; exit 1 ;;
+  esac
 }
 
 # ---------------------------------------------------------------- images
@@ -968,8 +1278,11 @@ cmd_vm() {
       del_line "$VMS" "$2"
       [ ! -e "$POWER" ] || del_line "$POWER" "$2"
       ports_sync
+      net_prune
       guest_dhcp
-      logf "vm del: $2 (address and SSH port released)" ;;
+      fip_route
+      fw_apply
+      logf "vm del: $2 (address, SSH port and tenant ports released, floating IP detached)" ;;
     info)
       [ $# -eq 2 ] || die "usage: hubctl vm info NAME"
       has "$VMS" "$2" || die "no guest $2"
@@ -1017,6 +1330,10 @@ case ${1:-help} in
   tenant) shift; cmd_tenant "$@" ;;
   tenants) cmd_tenant list ;;
   ips) shift; cmd_ips "$@" ;;
+  ip) shift; cmd_ip "$@" ;;
+  port) shift; cmd_port "$@" ;;
+  fip) shift; cmd_fip "$@" ;;
+  fips) shift; cmd_fip list "$@" ;;
   key) shift; cmd_key "$@" ;;
   keys) shift; cmd_key list "$@" ;;
   console) shift; cmd_console "$@" ;;

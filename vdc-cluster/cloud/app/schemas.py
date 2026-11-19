@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field, field_validator
 NAME = r"^[a-z][a-z0-9-]{0,15}$"          # tenant, guest, image (hub rule)
 NODE = r"^[a-z][a-z0-9]{0,7}$"
 USER = r"^[a-z][a-z0-9_.-]{1,31}$"
+IPV4 = r"^([0-9]{1,3}\.){3}[0-9]{1,3}$"
+TARGET = r"^([a-z][a-z0-9-]{0,15}|([0-9]{1,3}\.){3}[0-9]{1,3})$"   # a VM name or an address of my subnet
 
 
 class Token(BaseModel):
@@ -24,6 +26,9 @@ class Quota(BaseModel):
     max_mem_mb: int = Field(ge=0, le=1_048_576)
     max_disk_gb: int = Field(ge=0, le=10_000)
     max_tunnels: int = Field(2, ge=0, le=20, description="Cloudflare tunnels open at the same time")
+    max_ips: int = Field(2, ge=0, le=64, description="extra addresses of the tenant subnet")
+    max_ports: int = Field(5, ge=0, le=100, description="ports on the lab PC's campus address")
+    max_floating_ips: int = Field(1, ge=0, le=32, description="floating IPs booked")
 
 
 class Usage(BaseModel):
@@ -32,6 +37,9 @@ class Usage(BaseModel):
     mem_mb: int
     disk_gb: int
     tunnels: int = 0
+    ips: int = 0
+    ports: int = 0
+    floating_ips: int = 0
 
 
 # ---------------------------------------------------------------- tenants
@@ -92,7 +100,55 @@ class GuestAccess(BaseModel):
     ssh_port: Optional[int] = None    # on the lab PC's campus address
     ssh: str                          # the simplest way in: the campus port, else the jump host
     ssh_jump: str = ""
+    floating_ip: Optional[str] = None # every port of the guest, from campus
     console: str
+
+
+# ---------------------------------------------------------------- extra addresses, ports, floating IPs
+class ExtraIpIn(BaseModel):
+    ip: Optional[str] = Field(None, pattern=IPV4, description="omit: the next free address of my subnet")
+    note: Optional[str] = Field(None, pattern=r"^[a-z0-9._-]{1,32}$", examples=["metallb"])
+
+
+class ExtraIpOut(BaseModel):
+    ip: str
+    tenant: str
+    note: Optional[str] = None
+    floating_ip: Optional[str] = None
+    ports: list[int] = []             # campus ports that lead to it
+
+
+class PortIn(BaseModel):
+    target: str = Field(pattern=TARGET, examples=["web1", "10.199.20.30"],
+                        description="one of my VMs, or an address of my subnet (a VM's or an extra one)")
+    port: int = Field(ge=1, le=65535, examples=[80])
+    protocol: Literal["tcp", "udp"] = "tcp"
+    campus_port: Optional[int] = Field(None, ge=1, le=65535, description="omit: the next free one")
+
+
+class PortOut(BaseModel):
+    campus_port: int
+    protocol: str
+    tenant: str
+    target: str
+    address: Optional[str] = None
+    port: int
+    connect: str                      # <lab PC>:campus_port
+
+
+class FloatingIpIn(BaseModel):
+    target: Optional[str] = Field(None, pattern=TARGET, description="omit: only book it; attach it later")
+
+
+class AssociateIn(BaseModel):
+    target: str = Field(pattern=TARGET, examples=["web1", "10.199.20.30"])
+
+
+class FloatingIpOut(BaseModel):
+    ip: str
+    tenant: Optional[str] = None      # None: free in the pool (provider view)
+    target: Optional[str] = None      # None: booked but not attached
+    address: Optional[str] = None
 
 
 class AccessOut(BaseModel):
@@ -194,6 +250,7 @@ class VmIn(BaseModel):
     flavor: str = Field("tiny", pattern=NAME)
     image: str = Field("cirros", pattern=NAME)
     ip: Optional[str] = Field(None, description="omit: next free address of the tenant subnet")
+    floating_ip: bool = Field(False, description="also book a floating IP and attach it to the new VM")
 
 
 class VmOut(BaseModel):
@@ -206,6 +263,7 @@ class VmOut(BaseModel):
     mac: Optional[str] = None
     ssh_port: Optional[int] = None    # ssh -p PORT user@<lab PC>
     ssh: Optional[str] = None
+    floating_ip: Optional[str] = None
     vcpus: int
     mem_mb: int
     node: Optional[str] = None        # provider and auditor only
@@ -253,6 +311,7 @@ class Allocation(BaseModel):
     mac: Optional[str] = None
     vm: Optional[str] = None
     next_free: bool = False
+    extra: bool = False               # an extra address (POST /tenant/ips), not a VM's
 
 
 class NetworkOut(BaseModel):

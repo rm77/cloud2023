@@ -32,6 +32,9 @@ class Tenant(SQLModel, table=True):
     max_mem_mb: int
     max_disk_gb: int
     max_tunnels: int = 2
+    max_ips: int = 2
+    max_ports: int = 5
+    max_floating_ips: int = 1
     created: datetime = Field(default_factory=now)
 
 

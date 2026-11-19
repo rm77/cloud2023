@@ -8,7 +8,7 @@ from .infra.labhub import LabError
 from .services import refresh_edge
 
 
-def create_vm(name, tenant, flavor, image, ip=None):
+def create_vm(name, tenant, flavor, image, ip=None, floating_ip=False):
     with Session(engine) as s:
         f = s.get(Flavor, flavor)
         rec = s.get(Vm, name)
@@ -17,6 +17,12 @@ def create_vm(name, tenant, flavor, image, ip=None):
                                  mem=f.mem_mb, cpus=f.vcpus, disk=f"{f.disk_gb}G")
             if rec:
                 rec.status, rec.error = "active", ""
+            if floating_ip:                # the VM is up either way; a failure here is noted on it
+                try:
+                    out["floating_ip"] = attach_new_fip(tenant, name)
+                except LabError as e:
+                    if rec:
+                        rec.error = f"floating IP: {e}"[:300]
             return out
         except LabError as e:
             if rec:
@@ -26,6 +32,17 @@ def create_vm(name, tenant, flavor, image, ip=None):
             if rec:
                 s.add(rec); s.commit()
             refresh_edge()                 # the guest's campus SSH port, forwarded by the lab PC
+
+
+def attach_new_fip(tenant, name):
+    from .infra import labhub
+    fip = labhub.hub("fip", "alloc", tenant).strip().splitlines()[-1]
+    try:
+        labhub.hub("fip", "assoc", fip, name)
+    except LabError:
+        labhub.hub("fip", "release", fip)
+        raise
+    return fip
 
 
 def delete_vm(name):

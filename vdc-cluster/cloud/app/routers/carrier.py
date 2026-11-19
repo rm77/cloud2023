@@ -8,6 +8,12 @@ from ..infra import cluster as hub_cluster, labhub, nodes as hub_nodes
 router = APIRouter(prefix="/carrier", tags=["Carrier"], dependencies=[Depends(require_role("provider", "auditor"))])
 
 
+@router.get("/floating-ips", summary="Edge addresses: the floating IP pool and what each one carries")
+def floating_ips():
+    from .. import network
+    return network.list_fips(free=True)
+
+
 @router.get("/underlay", summary="Underlay health: full-MTU path to the hub and node reachability")
 def underlay():
     out = dict(hub=labhub.HUB_IP, mtu=hub_cluster.mtu_check())

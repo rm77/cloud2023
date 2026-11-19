@@ -10,7 +10,7 @@ from . import config, tunnels
 from .db import ConsoleSession, Tenant, Tunnel, Vm, now
 from .infra import images as hub_images, labhub
 from .schemas import AccessOut, ConsoleOut, GuestAccess, KeyOut, TunnelOut
-from .services import audit, gateway_of, guest_ports, hub_call, refresh_edge, ssh_direct
+from .services import audit, gateway_of, guest_fips, guest_ports, hub_call, refresh_edge, ssh_direct
 
 
 def hub_tenants() -> dict:
@@ -68,6 +68,7 @@ def access_of(s: Session, t: Tenant) -> AccessOut:
     users = {i["name"]: i["user"] for i in hub_call(hub_images.list)}
     hub_vms = {r["name"]: r for r in hub_call(labhub.hub_read, "vms")}
     ports = guest_ports()
+    fips = guest_fips(hub_vms)
     jump = f"t-{t.name}@{host}:{config.JUMP_PORT}"
     guests = []
     for v in s.exec(select(Vm).where(Vm.tenant_id == t.id).order_by(Vm.name)):
@@ -75,13 +76,17 @@ def access_of(s: Session, t: Tenant) -> AccessOut:
         user = users.get(v.image, "root")
         via_jump = f"ssh -J {jump} {user}@{ip}" if ip else ""
         port = ports.get(v.name)
+        fip = fips.get(v.name)
         guests.append(GuestAccess(name=v.name, ip=ip, user=user, ssh_port=port,
-                                  ssh=ssh_direct(port, user) or via_jump, ssh_jump=via_jump,
+                                  ssh=(f"ssh {user}@{fip}" if fip else None) or ssh_direct(port, user) or via_jump,
+                                  ssh_jump=via_jump, floating_ip=fip,
                                   console=f"POST /tenant/vms/{v.name}/console"))
-    # ~/.ssh/config: the campus port where a guest has one, otherwise through the jump host
+    # ~/.ssh/config: the floating IP, else the campus port, else through the jump host
     cfg = ""
     for g in guests:
-        if g.ssh_port:
+        if g.floating_ip:
+            cfg += f"Host {t.name}-{g.name}\n  HostName {g.floating_ip}\n  User {g.user}\n"
+        elif g.ssh_port:
             cfg += f"Host {t.name}-{g.name}\n  HostName {host}\n  Port {g.ssh_port}\n  User {g.user}\n"
         elif g.ip:
             cfg += f"Host {t.name}-{g.name}\n  HostName {g.ip}\n  User {g.user}\n  ProxyJump {jump}\n"

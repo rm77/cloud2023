@@ -29,6 +29,9 @@ REGISTRY = {
     "vms":     ["name", "tenant", "node", "image", "ip", "mem", "mac", "cpus"],
     "images":  ["name", "type", "mem", "disk", "user", "sha256", "size_mb"],
     "ports":   ["name", "port"],                  # campus SSH port per guest (cluster.sh edge)
+    "extips":  ["ip", "tenant", "note"],          # extra addresses of a tenant subnet
+    "tports":  ["port", "proto", "tenant", "target", "to"],   # tenant ports on the main PC
+    "fips":    ["fip", "tenant", "target"],       # booked floating IPs (target - = not attached)
 }
 
 
