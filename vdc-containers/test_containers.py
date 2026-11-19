@@ -407,8 +407,22 @@ class ContainerService(unittest.TestCase):
             self.wait(self.call("DELETE", f"/hosts/{h}"))
         self.assertEqual((KIT.vms, self.call("GET", "/hosts")[1]), ({}, []))
 
-    def test_12_an_unreachable_host(self):
+    def test_12_a_host_ahead_of_time(self):
+        self.wait(self.call("POST", "/hosts", token="tok-b"), token="tok-b")
+        hosts = self.call("GET", "/hosts", token="tok-b")[1]
+        self.assertEqual([(h["name"], h["status"], h["containers"]) for h in hosts], [("ctr-tenant-b-1", "ready", [])])
+        self.assertTrue(host_state(hosts[0]["ip"])["setup"])
         self.wait(self.call("POST", "", {"name": "lone", "image": "nginx", "mem_mb": 64}, token="tok-b"), token="tok-b")
+        self.assertEqual(self.call("GET", "/lone", token="tok-b")[1]["host"], "ctr-tenant-b-1")     # no second VM
+        self.assertEqual(len([v for v in KIT.vms.values() if v["tenant"] == "tenant-b"]), 1)
+        self.wait(self.call("POST", "/hosts", token="tok-b"), token="tok-b")                       # the second (of 2)
+        code, a = self.call("POST", "/hosts", token="tok-b")
+        self.assertEqual(code, 409)
+        self.assertIn("most allowed (2)", a["detail"])
+        self.assertEqual(self.call("POST", "/hosts", token="tok-p")[0], 403)
+        self.wait(self.call("DELETE", "/hosts/ctr-tenant-b-2", token="tok-b"), token="tok-b")
+
+    def test_13_an_unreachable_host(self):
         _, c = self.call("GET", "/lone", token="tok-b")
         path = os.path.join(HOSTS, c["address"] + ".json")
         st = host_state(c["address"])

@@ -77,7 +77,7 @@ curl -s $A/web -H "Authorization: Bearer $TOKEN"                                
 | `GET /addon/containers/{name}/logs?tail=100` | its output |
 | `POST /addon/containers/{name}/exec` `{"command": ["ls", "/"]}` | run a command in it (30 s at most) |
 | `POST /addon/containers/stacks` · `GET` · `GET/DELETE /stacks/{name}` · `/stacks/{name}/logs` | Compose stacks |
-| `GET /addon/containers/hosts` · `DELETE /hosts/{name}` | the container hosts; delete an empty one |
+| `GET /addon/containers/hosts` · `POST` · `DELETE /hosts/{name}` | the container hosts; add one ahead of time (`202` + job); delete an empty one |
 | `GET /addon/containers/jobs` · `/jobs/{id}` | jobs, each with a log of what was run where |
 | `GET /addon/containers/config` | the settings above, for a front end |
 
@@ -131,6 +131,37 @@ gone, so the next container starts at once; delete an empty host with
 A host is a normal VM of the tenant, so the tenant's own SSH keys work on it too, and
 `docker ps` there shows the containers (labelled `vdc.managed=1`). What separates tenants is the
 VM, not Docker: each tenant's containers run only on its own hosts.
+
+### Adding and removing container hosts
+
+Hosts come by themselves: the first container makes one, and a container that fits on none of
+the tenant's hosts makes another, up to `--max-hosts`. To have a host ready before it is needed,
+for example before a class so the first container starts at once, add one as a tenant user:
+
+```sh
+curl -s -X POST $A/hosts -H "Authorization: Bearer $TOKEN"
+# {"job": "host-create-...", "status_url": "/addon/containers/jobs/host-create-..."}
+```
+
+or with **Add a host** on the console's Container hosts page. It is the same as an automatic one:
+`ctr-<tenant>-N`, machine type `--host-flavor`, image `--host-image`, Docker installed, and
+`free_mb` of it for containers.
+
+To remove a host, first delete or move its containers and stacks, then
+`DELETE /addon/containers/hosts/{name}` (or the delete button on Container hosts); the add-on
+refuses while anything runs on it. A host that ended in `error` (its setup failed) can be
+deleted the same way.
+
+| To change | How |
+|---|---|
+| how many hosts a tenant may have | `--max-hosts` (all tenants); each host also counts against the tenant's VM quota |
+| how big a host is | `--host-flavor`: a bigger machine type fits more containers per host. Existing hosts keep their size; new ones get the new one |
+| what a host runs | `--host-image`, e.g. a baked image (below) |
+| how much memory a host keeps for itself | `--reserve-mb` |
+
+Container hosts are VMs, so the room for them comes from the cluster's nodes. When the hub
+can't place a new host (`no Ready node has N MB free`), add a spoke in the kit
+(`sudo ./cluster.sh spoke add`), or free memory on the nodes.
 
 ### Compose stacks
 

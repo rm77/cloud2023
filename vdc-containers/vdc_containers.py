@@ -358,6 +358,12 @@ def setup_host(h, log):
     h["status"] = "ready"
 
 
+def job_add_host(log, kit, me):
+    with tenant_lock(me["tenant"]):
+        h = create_host(kit, me, log)
+    log(f"container host {h['name']} is ready ({h['mem_mb'] - Conf.reserve_mb} MB for containers)")
+
+
 def host_or_new(kit, me, mem_mb, log):
     h = pick_host(me["tenant"], mem_mb)
     if h:
@@ -738,6 +744,15 @@ class Handler(BaseHTTPRequestHandler):
             if len(p) == 1 and m == "GET":
                 return 200, [host_out(h) for h in q("SELECT * FROM hosts" + (" WHERE tenant=?" if t else "") + " ORDER BY name",
                                                      (t,) if t else ())]
+            if len(p) == 1 and m == "POST":          # a host ahead of time, e.g. before a class
+                if role != "consumer":
+                    raise Fail(403, "a tenant user adds a container host (it is a VM of the tenant)")
+                n = len(q("SELECT 1 FROM hosts WHERE tenant=? AND status!='deleting'", (t,)))
+                if n >= Conf.max_hosts:
+                    raise Fail(409, f"tenant {t} has {n} container hosts, the most allowed ({Conf.max_hosts})")
+                jid = new_job(me, "host-create", t)
+                run_job(jid, job_add_host, kit, me)
+                return 202, {"job": jid, "status_url": f"{PREFIX}/jobs/{jid}"}
             if len(p) == 2:
                 h = one_host(p[1])
                 if not h or (t and h["tenant"] != t):

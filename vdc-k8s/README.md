@@ -134,6 +134,32 @@ Or without any of that, through the add-on: `POST /clusters/demo/kubectl` with
 The kubeconfig is the cluster's admin account: it can do anything in the cluster. The tenant's
 own SSH keys also open the node VMs.
 
+### Adding and removing nodes
+
+A node is a VM of the tenant. Workers are added and removed by scaling the cluster, as a tenant
+user, or with **Scale** on the cluster's page in the console:
+
+```sh
+curl -s -X PATCH $A/clusters/demo -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -d '{"workers": 3}'
+```
+
+- **More workers:** new VMs `k8s-demo-w<N>` (the lowest free numbers), set up as k3s agents and
+  joined with the control plane's token; they are ready when the job finishes
+  (`?state=true` on the cluster shows them `Ready` in Kubernetes).
+- **Fewer workers:** the highest-numbered workers are drained first (their pods move to the
+  others), deleted from Kubernetes, then their VMs are deleted.
+- `workers` goes from 0 (everything on the control plane) to `--max-workers`. Every node also
+  counts against the tenant's VM, vCPU and memory quota, and the job fails with the API's
+  `quota exceeded` when it doesn't fit.
+- The control plane stays one VM (`-cp1`); the add-on doesn't add control-plane nodes.
+- New nodes get the cluster's machine type. A bigger machine type for new clusters is
+  `--node-flavor` or `flavor` when creating; an existing cluster keeps its own.
+
+Nodes are VMs, so the room for them comes from the cluster's nodes in the kit. When the hub
+can't place a VM (`no Ready node has N MB free`), add a spoke (`sudo ./cluster.sh spoke add`),
+or free memory on the nodes.
+
 ### Services from campus
 
 A `LoadBalancer` Service gets one of the cluster's extra addresses from MetalLB and is reachable

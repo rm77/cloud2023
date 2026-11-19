@@ -1922,11 +1922,17 @@ async function ctrHostsPage(_, q) {
     {h: "Machine type", f: h => html`${h.flavor} <span class="muted small">${h.vcpus} vCPU, ${mem(h.mem_mb)}</span>`},
     {h: "Free for containers", f: h => html`${mem(h.free_mb)}`}, {h: "Runs", f: h => [...h.containers, ...h.stacks.map(s => s + " (stack)")].join(", ") || html`<span class="muted">nothing</span>`},
     {h: "", cls: "act", f: h => role() !== "auditor" ? ibtn("del", "ctrhost-delete", "Delete (empty hosts only)", {name: h.name, tenant: h.tenant}, h.containers.length + h.stacks.length > 0 || h.status === "deleting") : ""}].filter(Boolean);
-  return html`${pageHead("Container hosts", btn("Refresh", "refresh", {icon: "refresh", cls: "flat"}), "Containers")}
+  return html`${pageHead("Container hosts", html`${isCons() ? btn("Add a host", "ctrhost-add", {icon: "add"}) : ""}${btn("Refresh", "refresh", {icon: "refresh", cls: "flat"})}`, "Containers")}
     ${note("The VMs the container service made for the containers. They stay when their containers are gone, so the next container starts at once: delete an empty one to stop paying for it.")}
     ${tcard("", tenantFilter(tenants, q.tenant, "ctrhost-tenant"), table(cols, hs, {empty: "No container hosts yet: the first container makes one."}))}`;
 }
 ACT["ctrhost-tenant"] = (d, el) => { location.hash = "#/containers/hosts" + (el.value ? "?tenant=" + enc(el.value) : ""); };
+ACT["ctrhost-add"] = async () => {
+  const cfg = await api(`${CT}/config`);
+  if (!await confirmDlg("Add a container host?", `A new VM of your tenant (machine type ${cfg.host_flavor}, image ${cfg.host_image}) with Docker, ready for containers.
+    It is billed as a VM from now on, and takes a few minutes. Your tenant may have ${cfg.max_hosts} hosts.`, "Add", false)) return;
+  track(await api(`${CT}/hosts`, {method: "POST"}), "Add a container host"); route(true);
+};
 ACT["ctrhost-delete"] = async d => {
   if (!await confirmDlg(`Delete ${d.name}?`, "The empty container host VM is deleted.")) return;
   track(await api(`${CT}/hosts/${enc(d.name)}${tq(d.tenant)}`, {method: "DELETE"}), `Delete host ${d.name}`); route(true);
