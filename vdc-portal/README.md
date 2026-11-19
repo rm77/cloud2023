@@ -62,6 +62,17 @@ To keep it running, start it from a systemd unit, `tmux`, or `nohup python3 port
 | provider | dashboard (health, capacity, revenue); tenants (onboard, quota, internet, members, keys, off-board); accounts; import from hub; every tenant's VMs; images (import); machine types and prices; nodes (add spokes, evict); physical hosts; underlay; tunnels; jobs; billing; audit |
 | auditor | dashboard; audit log (filters, CSV); tenant reports; command journal; underlay; metering (the billing pages, read only) |
 
+More pages appear when what they need is there:
+
+| Pages | Shown when | Consumer | Provider | Auditor |
+|---|---|---|---|---|
+| External access / Edge addresses | the kit has campus ports, extra addresses and floating IPs | book, attach, detach and give back floating IPs; open and close campus ports; reserve and release extra addresses; quota bars on the dashboard | every tenant's, the free pool; take any back; the three limits in a tenant's quota | the floating IP pool |
+| Containers, Compose stacks, Container hosts | `--addon containers=...` (vdc-containers) | run a container (form with the equivalent REST request), logs, a command in it, start, stop, restart, delete; deploy and delete stacks; delete empty hosts | every tenant's; stop, start, delete | read only |
+| Kubernetes clusters | `--addon k8s=...` (vdc-k8s) | create, scale, delete; nodes and their Kubernetes state; kubeconfig (tunnel, inside, floating IP); run kubectl with a manifest; Services and what is reachable from campus; sync | every tenant's; sync, delete | read only |
+
+Each add-on page has the add-on's recent operations; a click on one shows its log: every
+command it ran, and on which host.
+
 Passwords: the API keeps only a hash, so nobody can look a password up. The provider resets one
 under Accounts (or a tenant's Members) with the key icon: the console deletes the account and
 creates it again with the same name, role, tenant and admin flag and the new password, and shows

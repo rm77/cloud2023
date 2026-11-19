@@ -235,6 +235,8 @@ const ICONS = {
   shield:"M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z",
   import:"M19 12v7H5v-7H3v7c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2v-7h-2zm-6 .67l2.59-2.58L17 11.5l-5 5-5-5 1.41-1.41L11 12.67V3h2z",
   ok:"M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z",
+  box:"M20 2H4c-1 0-2 .9-2 2v3.01c0 .72.43 1.34 1 1.69V20c0 1.1 1.1 2 2 2h14c.9 0 2-.9 2-2V8.7c.57-.35 1-.97 1-1.69V4c0-1.1-1-2-2-2zm-5 12H9v-2h6v2zm5-7H4V4h16v3z",
+  k8s:"M17.2 3H6.8l-5.2 9 5.2 9h10.4l5.2-9-5.2-9zm-1.15 16h-8.1L3.9 12l4.05-7h8.1l4.05 7-4.05 7zM12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z",
   close:"M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z",
 };
 const ico = (n, cls = "i") => raw(`<svg class="${cls}" viewBox="0 0 24 24"><path d="${ICONS[n] || ICONS.info}"/></svg>`);
@@ -475,6 +477,8 @@ function quotaBar(label, used, max, fmt = x => x) {
   return html`<div class="qrow"><span>${label}</span><span class="muted">${fmt(used)} / ${fmt(max)}</span></div>
     <div class="bar"><i class="${p >= 100 ? "full" : p >= 80 ? "hi" : ""}" style="width:${p.toFixed(1)}%"></i></div>`;
 }
+// the kit's edge quota (19 Nov 2026 on): shown when the kit reports it
+const edgeQuota = (u, q) => q.max_ports === undefined ? "" : html`${quotaBar("Floating IPs", u.floating_ips, q.max_floating_ips)}${quotaBar("Campus ports", u.ports, q.max_ports)}${quotaBar("Extra addresses", u.ips, q.max_ips)}`;
 function errorBox(msg) { return note(html`<b>Could not load this part.</b> ${msg}`, "err"); }
 
 // bar chart of a cost series (svg): {step: 1 day or 7, points: [{d: Date, v}]}
@@ -597,7 +601,7 @@ function showLogin(msg = "") {
   };
 }
 function logout(msg) {
-  S.token = null; S.me = null; S.flavors = null; S.addon = undefined; JOBS.length = 0;
+  S.token = null; S.me = null; S.flavors = null; S.addon = undefined; S.addons = []; S.edge = false; JOBS.length = 0;
   sessionStorage.removeItem("vdc.token"); $("#menu").classList.add("hidden");
   location.hash = ""; showLogin(msg);
 }
@@ -639,7 +643,8 @@ async function boot() {
   $("#ctx").innerHTML = (me.role === "consumer"
     ? html`${ico("tenants")}Tenant: <b>${me.tenant}</b>${me.tenant_admin ? html` · admin` : ""}`
     : me.role === "provider" ? html`${ico("shield")}Cloud provider · all tenants` : html`${ico("shield")}Cloud auditor · read only`).s;
-  $("#side").innerHTML = NAV[me.role].map(([g, items]) => html`${g ? html`<div class="grp">${g}</div>` : ""}${items.map(([h, l, i]) =>
+  await probeExtras();
+  $("#side").innerHTML = navFor(me.role).map(([g, items]) => html`${g ? html`<div class="grp">${g}</div>` : ""}${items.map(([h, l, i]) =>
     html`<a href="#${h}" data-nav="${h}">${ico(i)}${l}</a>`)}`.s).join("");
   if (!location.hash) location.hash = "#/";
   route();
@@ -752,7 +757,7 @@ let searchCache = null;
 $("#q").addEventListener("focus", async () => {
   if (searchCache) return;
   searchCache = [];
-  NAV[role()].forEach(([g, items]) => items.forEach(([h, l]) => searchCache.push({label: (g ? g + " › " : "") + l, href: "#" + h})));
+  navFor(role()).forEach(([g, items]) => items.forEach(([h, l]) => searchCache.push({label: (g ? g + " › " : "") + l, href: "#" + h})));
   if (role() !== "auditor") {
     const vms = await soft(api(P.vms()));
     if (!failed(vms)) vms.forEach(v => searchCache.push({label: `VM ${v.name}` + (isProv() ? ` (${v.tenant})` : ""), href: "#/vms/" + enc(v.name)}));
@@ -866,7 +871,7 @@ async function vmDetail({name}) {
       <div class="card"><h2>Details</h2>${kv([["Name", v.name], ["Tenant", isProv() ? html`<a href="#/tenants/${enc(v.tenant)}">${v.tenant}</a>` : v.tenant],
         ["Status", html`${st(v.status)} <span class="muted small">(API record)</span>`], ["Power state", v.state ? st(v.state) : "—"],
         ["Machine type", html`${v.flavor} · ${v.vcpus} vCPU · ${mem(v.mem_mb)}${f ? html` · ${f.disk_gb} GB disk` : ""}`],
-        ["Image", v.image], ["Internal IP", html`<span class="mono">${v.ip || "—"}</span>`], ["MAC", html`<span class="mono">${v.mac || "—"}</span>`],
+        ["Image", v.image], ["Internal IP", html`<span class="mono">${v.ip || "—"}</span>`], v.floating_ip && ["Floating IP", html`<span class="mono">${v.floating_ip}</span>`], ["MAC", html`<span class="mono">${v.mac || "—"}</span>`],
         v.node && ["Node", v.node], ["Created by", v.owner], ["Created", `${dt(v.created)} (${ago(v.created)})`]])}</div>
       <div class="card"><h2>Connect</h2>
         ${v.ssh ? html`<div class="flabel">SSH from campus</div>${copyLine(v.ssh)}` : html`<p class="muted">No SSH port yet (the VM has no address, or it is still being created).</p>`}
@@ -988,7 +993,7 @@ async function dashConsumer() {
       <a href="#/vms" class="small">All VM instances →</a>`}</div>
     <div class="card"><h2>Quota</h2>${quotaBar("VMs", u.vms, q.max_vms)}${quotaBar("vCPUs", u.vcpus, q.max_vcpus)}
       ${quotaBar("RAM", u.mem_mb, q.max_mem_mb, mem)}${quotaBar("Disk", u.disk_gb, q.max_disk_gb, x => x + " GB")}${quotaBar("Tunnels", u.tunnels, q.max_tunnels)}
-      <div class="small muted">Set by the provider. Ask them for more.</div></div>
+      ${edgeQuota(u, q)}<div class="small muted">Set by the provider. Ask them for more.</div></div>
     <div class="card"><h2>Billing</h2><div class="muted small">${mtd.label}, so far</div><div class="stat">${money(cost)}</div>
       <div class="qrow" style="margin-top:10px"><span>Forecast for the month</span><b>${money(forecast)}</b></div>
       <div class="qrow"><span>Running now</span><span>${rate(rateNow)} / h</span></div>${budgetBar(forecast, cost)}
@@ -1080,7 +1085,7 @@ async function networkPage() {
     <div class="card"><h2>Addresses</h2><div class="stats"><div><div class="stat">${n.allocations.filter(a => a.vm).length}</div><div class="muted small">in use</div></div>
       <div><div class="stat mono" style="font-size:20px">${(n.allocations.find(a => a.next_free) || {}).ip || "—"}</div><div class="muted small">next free</div></div></div></div></div>
   ${tcard("Address allocations", "", table([{h: "IP", f: a => html`<span class="mono">${a.ip}</span>`}, {h: "MAC", f: a => html`<span class="mono">${a.mac || "—"}</span>`},
-      {h: "VM", f: a => a.vm ? html`<a href="#/vms/${enc(a.vm)}">${a.vm}</a>` : "—"}, {h: "", f: a => a.next_free ? pill("next free", "blue") : ""}], n.allocations, {empty: "No addresses allocated yet."}))}`;
+      {h: "VM", f: a => a.vm ? html`<a href="#/vms/${enc(a.vm)}">${a.vm}</a>` : a.extra ? html`<a href="#/edge">extra address</a>` : "—"}, {h: "", f: a => a.next_free ? pill("next free", "blue") : ""}], n.allocations, {empty: "No addresses allocated yet."}))}`;
 }
 async function accessPage() {
   const a = await api("/tenant/access");
@@ -1339,7 +1344,7 @@ async function tenantDetail({name}) {
     <div class="card"><h2>Network</h2>${kv([["Display name", t.display_name], ["VNI", t.vni], ["Subnet", html`<span class="mono">${t.subnet}</span>`],
       ["Gateway", html`<span class="mono">${t.gateway}</span>`], ["Internet", t.internet ? pill("on", "ok") : pill("off")], ["Jump user", html`<code>${t.jump_user}</code>`], ["Onboarded", dt(t.created)]])}</div>
     <div class="card"><h2>Quota (contract)</h2>${quotaBar("VMs", u.vms, q.max_vms)}${quotaBar("vCPUs", u.vcpus, q.max_vcpus)}
-      ${quotaBar("RAM", u.mem_mb, q.max_mem_mb, mem)}${quotaBar("Disk", u.disk_gb, q.max_disk_gb, x => x + " GB")}${quotaBar("Tunnels", u.tunnels, q.max_tunnels)}</div>
+      ${quotaBar("RAM", u.mem_mb, q.max_mem_mb, mem)}${quotaBar("Disk", u.disk_gb, q.max_disk_gb, x => x + " GB")}${quotaBar("Tunnels", u.tunnels, q.max_tunnels)}${edgeQuota(u, q)}</div>
     <div class="card"><h2>This month</h2><div class="stat">${failed(use) ? "—" : money(use.total_cost)}</div>
       <div class="muted small">${failed(use) ? use.__error : `${num(sum(use.lines, l => l.vm_hours))} VM hours`}</div>
       <div style="margin-top:10px">${failed(use) ? "" : hbars(use.lines.map(l => ({label: l.vm, v: l.cost})).sort((a, b) => b.v - a.v).slice(0, 6))}</div></div>
@@ -1369,7 +1374,10 @@ ACT["tenant-quota"] = async d => {
       <div><label class="flabel">vCPUs</label><input class="inp" type="number" name="max_vcpus" min="0" value="${q.max_vcpus}"></div>
       <div><label class="flabel">Tunnels</label><input class="inp" type="number" name="max_tunnels" min="0" value="${q.max_tunnels}"></div></div>
     <div class="f row"><div><label class="flabel">RAM (MB)</label><input class="inp" type="number" name="max_mem_mb" min="0" value="${q.max_mem_mb}"></div>
-      <div><label class="flabel">Disk (GB)</label><input class="inp" type="number" name="max_disk_gb" min="0" value="${q.max_disk_gb}"></div></div>`,
+      <div><label class="flabel">Disk (GB)</label><input class="inp" type="number" name="max_disk_gb" min="0" value="${q.max_disk_gb}"></div></div>
+    ${q.max_ports === undefined ? "" : html`<div class="f row"><div><label class="flabel">Floating IPs</label><input class="inp" type="number" name="max_floating_ips" min="0" value="${q.max_floating_ips}"></div>
+      <div><label class="flabel">Campus ports</label><input class="inp" type="number" name="max_ports" min="0" value="${q.max_ports}"></div>
+      <div><label class="flabel">Extra addresses</label><input class="inp" type="number" name="max_ips" min="0" value="${q.max_ips}"></div></div>`}`,
     onOk: v => api(`/provider/tenants/${enc(d.name)}/quota`, {method: "PUT", body: Object.fromEntries(Object.entries(v).map(([k, x]) => [k, +x]))})})) { toast("Quota saved"); route(true); }
 };
 ACT["tenant-del"] = async d => {
@@ -1711,18 +1719,422 @@ async function pricingPage() {
     ${tcard("Machine types", "", table(flavorCols(false), fl))}${defs ? addonPriceTable(defs) : ""}`;
 }
 
+/* ================================================================= add-on services and the edge */
+// portal.py --addon NAME=URL passes /addon/NAME/... on, and /addon/addons lists the names: the
+// Containers (vdc-containers) and Kubernetes (vdc-k8s) pages show only when their add-on is there.
+// The edge pages (campus ports, extra addresses, floating IPs) need a kit that has them.
+S.addons = []; S.edge = false;
+async function probeExtras() {
+  const a = await soft(api("/addon/addons"));
+  S.addons = Array.isArray(a) ? a : [];
+  const e = await soft(api(isCons() ? "/tenant/ports" : isProv() ? "/provider/ports" : "/carrier/floating-ips"));
+  S.edge = !failed(e);
+}
+const hasAddon = n => S.addons.includes(n);
+const CT = "/addon/containers", K8 = "/addon/k8s";
+// an add-on item of another tenant: the provider and the auditor name its tenant
+const tq = (t, first = true) => !isCons() && t ? `${first ? "?" : "&"}tenant=${enc(t)}` : "";
+function navFor(r) {
+  const nav = NAV[r].map(([g, items]) => [g, [...items]]);
+  const grp = name => nav.find(([g]) => g === name);
+  const after = (name, entry) => { const i = nav.findIndex(([g]) => g === name); nav.splice(i < 0 ? 1 : i + 1, 0, entry); };
+  const k8s = hasAddon("k8s") ? ["Kubernetes", [["/k8s", "Clusters", "k8s"]]] : null;
+  const ctr = hasAddon("containers") ? ["Containers", [["/containers", "Containers", "box"], ["/containers/stacks", "Compose stacks", "list"],
+                                                      ["/containers/hosts", "Container hosts", "storage"]]] : null;
+  if (r === "auditor") {
+    if (k8s) after("Audit", k8s);
+    if (ctr) after("Audit", ctr);
+    if (S.edge) grp("Carrier")[1].push(["/edge", "Edge addresses", "public"]);
+    return nav;
+  }
+  if (k8s) after("Compute", k8s);
+  if (ctr) after("Compute", ctr);
+  if (S.edge) (r === "consumer" ? grp("Networking") : grp("Infrastructure"))[1].push(["/edge", r === "consumer" ? "External access" : "Edge addresses", "public"]);
+  return nav;
+}
+function addonJobsCard(base, tenant) {
+  return soft(api(`${base}/jobs${tq(tenant)}`)).then(jobs => html`<div class="card p0"><div class="ch"><h2>Recent operations</h2></div>
+    ${failed(jobs) ? errorBox(jobs.__error) : table([{h: "", f: j => st(j.state)},
+      {h: "Operation", f: j => html`<a href="#" data-act="addon-job" data-url="${j.status_url}">${j.kind}</a>`}, {h: "Target", f: j => j.target},
+      !isCons() && {h: "Tenant", f: j => j.tenant || "—"}, {h: "By", f: j => j.username}, {h: "Started", f: j => ago(j.created)},
+      {h: "Error", f: j => j.error ? html`<span class="small" style="color:var(--err)">${j.error}</span>` : ""}].filter(Boolean), jobs.slice(0, 10), {empty: "No operations yet."})}</div>`);
+}
+ACT["addon-job"] = async d => {
+  const j = await api(d.url);
+  await modal({title: `${j.kind} · ${j.target}`, ok: "", cancel: "Close", wide: true, body: html`
+    ${kv([["State", st(j.state)], ["By", j.username], ["Tenant", j.tenant], ["Started", dt(j.created)], ["Ended", j.ended ? dt(j.ended) : "—"], j.error && ["Error", j.error]])}
+    <div class="flabel" style="margin-top:12px">What was done, and where</div><pre class="code">${(j.log || []).join("\n") || "(nothing yet)"}</pre>`});
+};
+function tenantFilter(tenants, cur, act) {
+  return isCons() ? "" : html`<select class="inp" style="width:auto;height:32px" data-change="${act}">
+    <option value="">All tenants</option>${failed(tenants) ? "" : tenants.map(t => html`<option ${t.name === cur ? "selected" : ""}>${t.name}</option>`)}</select>`;
+}
+const tenantList = () => isProv() ? soft(api("/provider/tenants")) : Promise.resolve([]);
+const splitPorts = s => (s || "").split(/[\s,]+/).filter(Boolean).map(x => { const [p, pr] = x.split("/"); return pr ? {port: +p, protocol: pr.toLowerCase()} : +p; });
+const portsText = ps => (ps || []).map(p => p.protocol && p.protocol !== "tcp" ? `${p.port}/${p.protocol}` : p.port).join(", ");
+
+/* ---------------------------------------------------------------- containers (vdc-containers) */
+const ctrState = c => c.status === "running" && c.state && c.state !== "running" ? c.state : c.status;
+function ctrReach(c) {
+  const ps = c.ports || [];
+  if (!ps.length) return html`<span class="muted small">no published ports</span>`;
+  if (c.expose === "floating") return c.floating_ip ? html`${copyLine(c.floating_ip)}<div class="small muted">ports ${portsText(ps)} · inside: ${c.address}</div>`
+                                                    : html`<span class="muted small">${c.address || "—"}</span>`;
+  return html`${ps.map(p => html`<div class="small nowrap">${p.connect ? html`<b>${p.connect}</b> → ` : ""}<span class="mono">${c.address || "?"}:${p.host_port}</span>
+    <span class="muted">→ :${p.port}${p.protocol === "udp" ? "/udp" : ""}</span></div>`)}`;
+}
+function ctrActions(c) {
+  const d = {name: c.name, tenant: c.tenant}, s = ctrState(c), busy = ["creating", "deleting"].includes(c.status), w = role() !== "auditor";
+  return html`${w ? html`${ibtn("play", "ctr-power", "Start", {...d, action: "start"}, busy || s === "running" || c.status === "error")}
+    ${ibtn("stop", "ctr-power", "Stop", {...d, action: "stop"}, busy || s !== "running")}
+    ${ibtn("refresh", "ctr-power", "Restart", {...d, action: "restart"}, busy || c.status === "error")}` : ""}
+    ${ibtn("doc", "ctr-logs", "Logs", d, busy || c.status === "error")}
+    ${isCons() ? ibtn("terminal", "ctr-exec", "Run a command in it", d, s !== "running") : ""}
+    ${w ? ibtn("del", "ctr-delete", "Delete", d, c.status === "deleting") : ""}`;
+}
+async function containersPage(_, q) {
+  const [cs, cfg, tenants] = await Promise.all([api(`${CT}?state=true${tq(q.tenant, false)}`), soft(api(`${CT}/config`)), tenantList()]);
+  const cols = [{h: "Status", f: c => st(ctrState(c))},
+    {h: "Name", f: c => html`<b>${c.name}</b>${c.error ? html`<div class="small" style="color:var(--err)">${c.error}</div>` : ""}`},
+    !isCons() && {h: "Tenant", f: c => c.tenant}, {h: "Image", f: c => html`<span class="mono small">${c.image}</span>`},
+    {h: "Host", f: c => c.host || "—"}, {h: "Size", f: c => html`${num(c.cpus)} vCPU · ${mem(c.mem_mb)}`},
+    {h: "Reach it", f: ctrReach}, {h: "", cls: "act", f: ctrActions}].filter(Boolean);
+  return html`${pageHead("Containers", html`${isCons() ? btn("Run a container", "go", {icon: "add", data: {href: "#/containers/new"}}) : ""}${btn("Refresh", "refresh", {icon: "refresh", cls: "flat"})}`, "Containers")}
+    ${note(html`Containers run on <a href="#/containers/hosts">container hosts</a>: VMs of the tenant that the service creates and fills
+      (machine type <b>${failed(cfg) ? "?" : cfg.host_flavor}</b>, at most ${failed(cfg) ? "?" : cfg.max_hosts} per tenant). The first container of a tenant
+      therefore takes a few minutes; the hosts are billed as VMs.`)}
+    ${tcard("", html`${tenantFilter(tenants, q.tenant, "ctr-tenant")}<span class="small muted">${cs.length} container(s)</span>`,
+      table(cols, cs, {empty: isCons() ? html`No containers yet. <a href="#/containers/new">Run your first one</a>.` : "No containers."}))}
+    ${await addonJobsCard(CT, q.tenant)}`;
+}
+ACT["ctr-tenant"] = (d, el) => { location.hash = "#/containers" + (el.value ? "?tenant=" + enc(el.value) : ""); };
+ACT["ctr-power"] = async d => {
+  await api(`${CT}/${enc(d.name)}/${d.action}${tq(d.tenant)}`, {method: "POST"}); toast(`${cap(d.action)}: ${d.name}`); route(true);
+};
+ACT["ctr-logs"] = async d => {
+  const r = await api(`${CT}/${enc(d.name)}/logs?tail=300${tq(d.tenant, false)}`);
+  await modal({title: `Logs of ${d.name}`, ok: "", cancel: "Close", wide: true, body: html`<pre class="code">${r.logs || "(empty)"}</pre>`});
+};
+ACT["ctr-exec"] = async d => {
+  const r = await modal({title: `Run a command in ${d.name}`, ok: "Run", body: html`
+    <div class="f"><label>Command</label><input type="text" name="cmd" placeholder="e.g. ls -l /usr/share/nginx/html" required>
+    <div class="hint">Like <code>docker exec</code>: split into words like a shell would, but run without a shell; 30 seconds at most.</div></div>`,
+    onOk: v => api(`${CT}/${enc(d.name)}/exec`, {method: "POST", body: {command: v.cmd}})});
+  if (r && r.output !== undefined) await modal({title: `Exit code ${r.exit_code}`, ok: "", cancel: "Close", wide: true, body: html`<pre class="code">${r.output || "(no output)"}</pre>`});
+};
+ACT["ctr-delete"] = async d => {
+  if (!await typedConfirm(`Delete ${d.name}?`, "The container is removed, with its campus ports, its own address and its floating IP. Data inside it is lost.", d.name)) return;
+  track(await api(`${CT}/${enc(d.name)}${tq(d.tenant)}`, {method: "DELETE"}), `Delete container ${d.name}`); route(true);
+};
+
+async function containerCreate() {
+  S.holdRefresh = true;
+  const [cfg, me] = await Promise.all([soft(api(`${CT}/config`)), api("/tenant/me")]);
+  const u = me.usage, qq = me.quota;
+  return html`${pageHead("Run a container", "", html`<a href="#/containers">Containers</a> › run`)}
+  <div class="cols"><form id="ctrform" autocomplete="off"><div class="card">
+    <div class="f"><label>Name</label><input type="text" name="name" placeholder="e.g. web">
+      <div class="hint">Lowercase letters, digits and dashes, starting with a letter, at most 31.</div></div>
+    <div class="f"><label>Image</label><input type="text" name="image" placeholder="e.g. nginx:alpine, ghcr.io/org/app:1.2">
+      <div class="hint">Pulled from its registry (Docker Hub when no registry is named) the first time a host runs it.</div></div>
+    <div class="f row"><div><label class="flabel">vCPUs</label><input class="inp" type="number" name="cpus" step="0.1" min="0.1" max="8" value="0.5"></div>
+      <div><label class="flabel">Memory (MB)</label><input class="inp" type="number" name="mem_mb" min="32" max="16384" value="256"></div></div>
+    <div class="f"><label>Ports the container listens on</label><input type="text" name="ports" placeholder="e.g. 80, 53/udp"></div>
+    <div class="f"><span class="flabel">Who reaches those ports</span><div class="opts">
+      <label class="opt"><input type="radio" name="expose" value="internal" checked><b>My network</b><span class="small">from my VMs and containers only</span></label>
+      <label class="opt ${S.edge ? "" : "dis"}"><input type="radio" name="expose" value="ports" ${S.edge ? "" : "disabled"}><b>Campus ports</b><span class="small">one port on the lab PC each</span>
+        <div class="small muted">${u.ports ?? 0} of ${qq.max_ports ?? "?"} ports in use</div></label>
+      <label class="opt ${S.edge ? "" : "dis"}"><input type="radio" name="expose" value="floating" ${S.edge ? "" : "disabled"}><b>Floating IP</b><span class="small">a campus address of its own, every port</span>
+        <div class="small muted">${u.floating_ips ?? 0} of ${qq.max_floating_ips ?? "?"} in use; also an extra address</div></label></div></div>
+    <details><summary class="flabel" style="cursor:pointer;display:inline">Command and environment (optional)</summary>
+      <div class="f" style="margin-top:10px"><label>Command</label><input type="text" name="command" placeholder="the image's own when empty, e.g. sleep infinity"></div>
+      <div class="f"><label>Environment</label><textarea name="env" placeholder="NAME=value, one per line"></textarea></div></details>
+    <div class="merr hidden" id="ctrerr" style="color:var(--err);background:var(--err-l);padding:8px 12px;border-radius:4px;margin:12px 0"></div>
+    <div style="display:flex;gap:8px;margin-top:16px"><button class="btn pri" type="submit">Run</button><a class="btn flat" href="#/containers">Cancel</a></div>
+  </div></form>
+  <div class="sticky"><div class="card"><h2>Where it runs</h2><p class="small">On one of your container hosts with enough free memory, or on a new one
+    (${failed(cfg) ? "a VM" : html`a <b>${cfg.host_flavor}</b> VM of image <b>${cfg.host_image}</b>`}), which is billed as a VM.
+    It restarts by itself after a crash or a host reboot, unless you stop it.</p></div>
+    <div class="card"><details class="eq" open><summary>Equivalent REST request</summary><pre class="code" id="ctrrest"></pre></details></div></div></div>`;
+}
+function ctrBody() {
+  const v = Object.fromEntries(new FormData($("#ctrform")));
+  const b = {name: (v.name || "").trim(), image: (v.image || "").trim(), cpus: +v.cpus || 0.5, mem_mb: +v.mem_mb || 256, expose: v.expose || "internal"};
+  const ports = splitPorts(v.ports); if (ports.length) b.ports = ports;
+  if ((v.command || "").trim()) b.command = v.command.trim();
+  const env = {}; (v.env || "").split("\n").map(l => l.trim()).filter(Boolean).forEach(l => { const i = l.indexOf("="); if (i > 0) env[l.slice(0, i).trim()] = l.slice(i + 1); });
+  if (Object.keys(env).length) b.env = env;
+  return b;
+}
+containerCreate.after = () => {
+  const upd = () => { $("#ctrrest").textContent = `POST ${CT}\nContent-Type: application/json\n\n${JSON.stringify(ctrBody(), null, 2)}\n\n# → 202 {"job": "...", "status_url": "${CT}/jobs/..."}`; };
+  $("#ctrform").addEventListener("input", upd); upd();
+  $("#ctrform").onsubmit = async e => {
+    e.preventDefault();
+    const b = ctrBody(), err = $("#ctrerr"), sb = $("button[type=submit]", e.target);
+    sb.disabled = true; err.classList.add("hidden");
+    try { track(await api(CT, {method: "POST", body: b}), `Run container ${b.name}`); S.holdRefresh = false; location.hash = "#/containers"; }
+    catch (ex) { err.textContent = ex.message; err.classList.remove("hidden"); sb.disabled = false; }
+  };
+};
+
+async function stacksPage(_, q) {
+  const [ss, tenants] = await Promise.all([api(`${CT}/stacks?state=true${tq(q.tenant, false)}`), tenantList()]);
+  const cols = [{h: "Status", f: s => st(s.status)},
+    {h: "Name", f: s => html`<b>${s.name}</b>${s.error ? html`<div class="small" style="color:var(--err)">${s.error}</div>` : ""}`},
+    !isCons() && {h: "Tenant", f: s => s.tenant}, {h: "Host", f: s => s.host || "—"}, {h: "Memory kept", f: s => mem(s.mem_mb)},
+    {h: "Services", f: s => (s.services || []).length ? html`${s.services.map(x => html`<div class="small nowrap">${st(x.state)} ${x.name}</div>`)}` : html`<span class="muted">—</span>`},
+    {h: "Campus", f: s => (s.ports || []).some(p => p.connect) ? html`${s.ports.filter(p => p.connect).map(p => html`<div class="small"><b>${p.connect}</b> → host :${p.port}</div>`)}` : html`<span class="muted small">${portsText(s.ports) || "—"}</span>`},
+    {h: "", cls: "act", f: s => html`${ibtn("doc", "stack-show", "Compose file and logs", {name: s.name, tenant: s.tenant})}
+      ${role() !== "auditor" ? ibtn("del", "stack-delete", "Delete", {name: s.name, tenant: s.tenant}, s.status === "deleting") : ""}`}].filter(Boolean);
+  return html`${pageHead("Compose stacks", html`${isCons() ? btn("Deploy a stack", "stack-new", {icon: "add"}) : ""}${btn("Refresh", "refresh", {icon: "refresh", cls: "flat"})}`, "Containers")}
+    ${note("A stack is a compose.yaml run with docker compose on one of the tenant's container hosts.")}
+    ${tcard("", tenantFilter(tenants, q.tenant, "stack-tenant"), table(cols, ss, {empty: "No stacks."}))}
+    ${await addonJobsCard(CT, q.tenant)}`;
+}
+ACT["stack-tenant"] = (d, el) => { location.hash = "#/containers/stacks" + (el.value ? "?tenant=" + enc(el.value) : ""); };
+const COMPOSE_EXAMPLE = "services:\n  web:\n    image: nginx:alpine\n    ports: ['8081:80']\n  redis:\n    image: redis:7-alpine\n";
+ACT["stack-new"] = async () => {
+  const r = await modal({title: "Deploy a Compose stack", ok: "Deploy", wide: true, body: html`
+    <div class="f"><label>Name</label><input type="text" name="name" placeholder="e.g. shop"></div>
+    <div class="f"><label>compose.yaml</label><textarea name="compose" style="min-height:200px">${COMPOSE_EXAMPLE}</textarea></div>
+    <div class="f row"><div><label class="flabel">Memory to keep free (MB)</label><input class="inp" type="number" name="mem_mb" min="64" value="512"></div>
+      <div><label class="flabel">Host ports it publishes</label><input class="inp" type="text" name="ports" placeholder="e.g. 8081"></div>
+      <div><label class="flabel">Who reaches them</label><select class="inp" name="expose"><option value="internal">my network</option>${S.edge ? html`<option value="ports">campus ports</option>` : ""}</select></div></div>
+    <div class="hint">The service doesn't read the file: list the host ports it publishes (outside 20000-20999) so they can get campus ports.</div>`,
+    onOk: v => api(`${CT}/stacks`, {method: "POST", body: {name: v.name.trim(), compose: v.compose, mem_mb: +v.mem_mb, expose: v.expose, ports: splitPorts(v.ports)}})});
+  if (r && r.job) { track(r, "Deploy stack"); route(true); }
+};
+ACT["stack-show"] = async d => {
+  const [s, logs] = await Promise.all([api(`${CT}/stacks/${enc(d.name)}${tq(d.tenant)}`), soft(api(`${CT}/stacks/${enc(d.name)}/logs?tail=200${tq(d.tenant, false)}`))]);
+  await modal({title: `Stack ${d.name}`, ok: "", cancel: "Close", wide: true, body: html`<div class="flabel">compose.yaml</div><pre class="code" style="max-height:220px">${s.compose}</pre>
+    <div class="flabel" style="margin-top:12px">Logs</div><pre class="code">${failed(logs) ? logs.__error : logs.logs || "(empty)"}</pre>`});
+};
+ACT["stack-delete"] = async d => {
+  if (!await typedConfirm(`Delete stack ${d.name}?`, "docker compose down -v: its containers and volumes are removed, and its campus ports closed.", d.name)) return;
+  track(await api(`${CT}/stacks/${enc(d.name)}${tq(d.tenant)}`, {method: "DELETE"}), `Delete stack ${d.name}`); route(true);
+};
+
+async function ctrHostsPage(_, q) {
+  const [hs, tenants] = await Promise.all([api(`${CT}/hosts${tq(q.tenant)}`), tenantList()]);
+  const cols = [{h: "Status", f: h => st(h.status)}, {h: "Host VM", f: h => html`${isCons() || isProv() ? html`<a href="#/vms/${enc(h.name)}"><b>${h.name}</b></a>` : html`<b>${h.name}</b>`}${h.error ? html`<div class="small" style="color:var(--err)">${h.error}</div>` : ""}`},
+    !isCons() && {h: "Tenant", f: h => h.tenant}, {h: "Address", f: h => html`<span class="mono">${h.ip || "—"}</span>`},
+    {h: "Machine type", f: h => html`${h.flavor} <span class="muted small">${h.vcpus} vCPU, ${mem(h.mem_mb)}</span>`},
+    {h: "Free for containers", f: h => html`${mem(h.free_mb)}`}, {h: "Runs", f: h => [...h.containers, ...h.stacks.map(s => s + " (stack)")].join(", ") || html`<span class="muted">nothing</span>`},
+    {h: "", cls: "act", f: h => role() !== "auditor" ? ibtn("del", "ctrhost-delete", "Delete (empty hosts only)", {name: h.name, tenant: h.tenant}, h.containers.length + h.stacks.length > 0 || h.status === "deleting") : ""}].filter(Boolean);
+  return html`${pageHead("Container hosts", btn("Refresh", "refresh", {icon: "refresh", cls: "flat"}), "Containers")}
+    ${note("The VMs the container service made for the containers. They stay when their containers are gone, so the next container starts at once: delete an empty one to stop paying for it.")}
+    ${tcard("", tenantFilter(tenants, q.tenant, "ctrhost-tenant"), table(cols, hs, {empty: "No container hosts yet: the first container makes one."}))}`;
+}
+ACT["ctrhost-tenant"] = (d, el) => { location.hash = "#/containers/hosts" + (el.value ? "?tenant=" + enc(el.value) : ""); };
+ACT["ctrhost-delete"] = async d => {
+  if (!await confirmDlg(`Delete ${d.name}?`, "The empty container host VM is deleted.")) return;
+  track(await api(`${CT}/hosts/${enc(d.name)}${tq(d.tenant)}`, {method: "DELETE"}), `Delete host ${d.name}`); route(true);
+};
+
+/* ---------------------------------------------------------------- Kubernetes (vdc-k8s) */
+async function clustersPage(_, q) {
+  const [cs, cfg, tenants] = await Promise.all([api(`${K8}/clusters${tq(q.tenant)}`), soft(api(`${K8}/config`)), tenantList()]);
+  const cols = [{h: "Status", f: c => st(c.status)}, {h: "Name", f: c => html`<a href="#/k8s/${enc(c.name)}${tq(c.tenant)}"><b>${c.name}</b></a>${c.error ? html`<div class="small" style="color:var(--err)">${c.error}</div>` : ""}`},
+    !isCons() && {h: "Tenant", f: c => c.tenant}, {h: "Version", f: c => c.version || "—"},
+    {h: "Nodes", f: c => html`${c.nodes.length} <span class="muted small">(1 control plane, ${c.nodes.length - 1} worker)</span>`}, {h: "Machine type", f: c => c.flavor},
+    {h: "LoadBalancer addresses", f: c => html`<span class="mono small">${c.lb_ips.join(", ") || "—"}</span>`},
+    {h: "Exposed", f: c => c.exposures.length ? html`${c.exposures.map(e => html`<div class="small">${e.namespace}/${e.service} → <b>${e.connect || e.error}</b></div>`)}` : html`<span class="muted">—</span>`},
+    {h: "", cls: "act", f: c => role() !== "auditor" ? ibtn("del", "k8s-delete", "Delete", {name: c.name, tenant: c.tenant}, c.status === "deleting") : ""}].filter(Boolean);
+  return html`${pageHead("Kubernetes clusters", html`${isCons() ? btn("Create cluster", "k8s-new", {icon: "add"}) : ""}${btn("Refresh", "refresh", {icon: "refresh", cls: "flat"})}`, "Kubernetes")}
+    ${note(html`k3s on VMs of the tenant (<b>k8s-&lt;name&gt;-cp1</b> and workers), billed as VMs.
+      ${failed(cfg) ? "" : html`Nodes: ${cfg.node_flavor} · k3s ${cfg.k3s} · MetalLB ${cfg.metallb} · at most ${cfg.max_clusters} cluster(s) per tenant, ${cfg.max_workers} workers.`}`)}
+    ${tcard("", tenantFilter(tenants, q.tenant, "k8s-tenant"), table(cols, cs, {empty: isCons() ? "No clusters yet." : "No clusters."}))}
+    ${await addonJobsCard(K8, q.tenant)}`;
+}
+ACT["k8s-tenant"] = (d, el) => { location.hash = "#/k8s" + (el.value ? "?tenant=" + enc(el.value) : ""); };
+ACT["k8s-new"] = async () => {
+  const [cfg, fl, me] = await Promise.all([api(`${K8}/config`), flavors(), api("/tenant/me")]);
+  const r = await modal({title: "Create a Kubernetes cluster", ok: "Create", wide: true, body: html`
+    <div class="f row"><div><label class="flabel">Name</label><input class="inp" type="text" name="name" placeholder="e.g. demo" maxlength="8"></div>
+      <div><label class="flabel">Workers</label><input class="inp" type="number" name="workers" min="0" max="${cfg.max_workers}" value="1"></div>
+      <div><label class="flabel">Machine type</label><select class="inp" name="flavor">${fl.map(f => html`<option value="${f.name}" ${f.name === cfg.node_flavor ? "selected" : ""}>${f.name} (${f.vcpus} vCPU, ${mem(f.mem_mb)})</option>`)}</select></div></div>
+    <div class="hint" style="margin:-6px 0 12px">Name: 1-8 letters, digits or -. Its VMs are k8s-&lt;name&gt;-cp1, -w1, ... A k3s control plane wants 2 GB.</div>
+    <div class="f row"><div><label class="flabel">LoadBalancer addresses</label><input class="inp" type="number" name="lb_ips" min="0" max="8" value="${S.edge ? 1 : 0}" ${S.edge ? "" : "disabled"}></div>
+      <div><label class="flabel">kubectl from</label><select class="inp" name="api"><option value="tunnel">jump-host tunnel</option>${S.edge ? html`<option value="floating">a floating IP (campus)</option>` : ""}</select></div>
+      <div><label class="flabel">Ingress</label><label class="small" style="display:flex;gap:6px;align-items:center;height:36px"><input type="checkbox" name="ingress"> Traefik</label></div></div>
+    <div class="hint">One extra address per LoadBalancer Service (${me.usage.ips ?? 0} of ${me.quota.max_ips ?? "?"} extra addresses in use). Traefik takes one of them.</div>`,
+    onOk: v => api(`${K8}/clusters`, {method: "POST", body: {name: v.name.trim(), workers: +v.workers, flavor: v.flavor, lb_ips: +(v.lb_ips || 0), api: v.api, ingress: !!v.ingress}})});
+  if (r && r.job) { track(r, "Create cluster"); route(true); }
+};
+ACT["k8s-delete"] = async d => {
+  if (!await typedConfirm(`Delete cluster ${d.name}?`, "Its VMs are deleted, and its addresses, campus ports and floating IPs given back. Everything running in it is lost.", d.name)) return;
+  track(await api(`${K8}/clusters/${enc(d.name)}${tq(d.tenant)}`, {method: "DELETE"}), `Delete cluster ${d.name}`);
+  if (parseHash().path.startsWith("/k8s/")) location.hash = "#/k8s"; else route(true);
+};
+async function clusterDetail({name}, q) {
+  const c = await api(`${K8}/clusters/${enc(name)}?state=true${tq(q.tenant, false)}`);
+  const ready = c.status === "ready" || c.status === "scaling";
+  const svcs = ready ? await soft(api(`${K8}/clusters/${enc(name)}/services${tq(c.tenant)}`)) : [];
+  const d = {name, tenant: c.tenant};
+  return html`${pageHead(c.name, html`<span style="margin-right:8px">${st(c.status)}</span>
+      ${isCons() ? btn("Scale", "k8s-scale", {icon: "tune", cls: "flat", data: {...d, workers: c.workers}, disabled: c.status !== "ready"}) : ""}
+      ${role() !== "auditor" ? btn("Sync exposure", "k8s-sync", {icon: "refresh", cls: "flat", data: d, disabled: !ready}) : ""}
+      ${role() !== "auditor" ? btn("Delete", "k8s-delete", {icon: "del", cls: "flat danger", data: d, disabled: c.status === "deleting"}) : ""}`,
+      html`<a href="#/k8s">Kubernetes clusters</a> › details`)}
+    ${c.error ? note(html`<b>Error:</b> ${c.error}`, "err") : ""}${c.live_error ? note(html`Kubernetes did not answer: ${c.live_error}`, "warn") : ""}
+    <div class="cols"><div>
+      <div class="card"><h2>Details</h2>${kv([["Tenant", c.tenant], ["k3s", c.version || "—"], ["Workers", c.workers], ["Machine type", c.flavor], ["Image", c.image],
+        ["LoadBalancer addresses", html`<span class="mono">${c.lb_ips.join(", ") || "none"}</span>`], ["API server", c.api_fip ? html`floating IP <span class="mono">${c.api_fip}</span>` : "through the jump host"],
+        ["Ingress (Traefik)", c.ingress ? "yes" : "no"], ["Created", `${dt(c.created)} (${ago(c.created)})`]])}</div>
+      <div class="card p0"><div class="ch"><h2>Nodes</h2></div>${table([{h: "VM", f: n => isCons() || isProv() ? html`<a href="#/vms/${enc(n.name)}">${n.name}</a>` : n.name},
+        {h: "Role", f: n => n.role === "server" ? "control plane" : "worker"}, {h: "Address", f: n => html`<span class="mono">${n.ip || "—"}</span>`},
+        {h: "Setup", f: n => st(n.status)}, {h: "Kubernetes", f: n => n.k8s ? st(n.k8s.status) : html`<span class="muted">—</span>`}], c.nodes)}</div>
+      ${isCons() && ready ? html`<div class="card"><h2>kubectl</h2>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">${btn("Kubeconfig (tunnel)", "k8s-kubeconfig", {icon: "download", cls: "sm", data: {...d, access: "tunnel"}})}
+          ${btn("Kubeconfig (inside)", "k8s-kubeconfig", {icon: "download", cls: "sm flat", data: {...d, access: "internal"}})}
+          ${c.api_fip ? btn("Kubeconfig (floating IP)", "k8s-kubeconfig", {icon: "download", cls: "sm flat", data: {...d, access: "floating"}}) : ""}</div>
+        <form id="kform"><div class="f"><label>Run here</label><input type="text" name="args" value="get pods -A -o wide" style="font-family:var(--mono)">
+          <div class="hint">kubectl's arguments, without "kubectl". Campus exposure is synced after each command.</div></div>
+          <details><summary class="flabel" style="cursor:pointer;display:inline">Manifest for <code>-f -</code></summary>
+            <div class="f" style="margin-top:8px"><textarea name="stdin" style="min-height:160px" placeholder="apiVersion: apps/v1&#10;kind: Deployment&#10;..."></textarea></div></details>
+          <button class="btn pri sm" type="submit" style="margin-top:8px">${ico("terminal")}Run</button></form>
+        <pre class="code hidden" id="kout" style="margin-top:12px"></pre></div>` : ""}
+    </div><div>
+      <div class="card p0"><div class="ch"><h2>Reachable from campus</h2></div>
+        ${table([{h: "Service", f: e => `${e.namespace}/${e.service}`}, {h: "How", f: e => e.mode === "floating" ? "floating IP" : `port ${e.port}/${e.protocol}`},
+          {h: "Address", f: e => e.connect ? copyLine(e.connect) : html`<span class="small" style="color:var(--err)">${e.error}</span>`}], c.exposures,
+          {empty: html`None. Annotate a LoadBalancer Service with <code>vdc/expose: port</code> or <code>floating</code>, then sync.`})}</div>
+      <div class="card p0"><div class="ch"><h2>Services</h2></div>${failed(svcs) ? errorBox(svcs.__error) : table([{h: "Service", f: s => `${s.namespace}/${s.name}`},
+        {h: "Type", f: s => s.type}, {h: "Address", f: s => html`<span class="mono small">${s.lb_ip || s.cluster_ip || "—"}</span>`},
+        {h: "Ports", f: s => s.ports.map(p => p.port + (p.node_port ? `:${p.node_port}` : "")).join(", ")}, {h: "Expose", f: s => s.expose ? pill(s.expose, "blue") : ""}], svcs, {empty: ready ? "No Services." : "Not ready yet."})}</div>
+    </div></div>`;
+}
+clusterDetail.after = ({name}) => {
+  const f = $("#kform"); if (!f) return;
+  f.onsubmit = async e => {
+    e.preventDefault();
+    const v = Object.fromEntries(new FormData(f)), out = $("#kout"), sb = $("button[type=submit]", f);
+    sb.disabled = true; out.classList.remove("hidden"); out.textContent = "running…";
+    try {
+      const r = await api(`${K8}/clusters/${enc(name)}/kubectl`, {method: "POST", body: {args: v.args, stdin: v.stdin && v.stdin.trim() ? v.stdin : undefined}});
+      out.textContent = `$ kubectl ${v.args}\n${r.output}${r.exit_code ? `\n(exit code ${r.exit_code})` : ""}${(r.sync || []).length ? "\n\n# campus exposure\n" + r.sync.join("\n") : ""}`;
+      if ((r.sync || []).length) setTimeout(() => route(true), 1500);
+    } catch (ex) { out.textContent = ex.message; }
+    sb.disabled = false;
+  };
+};
+ACT["k8s-kubeconfig"] = async d => {
+  const k = await api(`${K8}/clusters/${enc(d.name)}/kubeconfig?access=${d.access}`);
+  await modal({title: `Kubeconfig of ${d.name} (${d.access})`, ok: "", cancel: "Close", wide: true, body: html`
+    ${kv([["API server", html`<span class="mono">${k.server}</span>`], ["How", d.access === "tunnel" ? copyLine(k.how.replace(/^.*?:\s+/, "")) : k.how]])}
+    ${d.access === "tunnel" ? note("Keep the ssh command running while you use kubectl; it needs your tenant's SSH key.") : ""}
+    <div style="display:flex;gap:8px;margin:12px 0">${btn("Download", "dl", {icon: "download", cls: "sm", data: {text: k.kubeconfig, file: `${d.name}.kubeconfig`}})}
+      ${btn("Copy", "copy", {icon: "copy", cls: "sm flat", data: {text: k.kubeconfig}})}</div>
+    <div class="small muted">Then: <code>KUBECONFIG=${d.name}.kubeconfig kubectl get nodes</code>. It is the cluster's admin account: keep it private.</div>`});
+};
+ACT["k8s-scale"] = async d => {
+  const cfg = await api(`${K8}/config`);
+  const r = await modal({title: `Scale ${d.name}`, ok: "Scale", body: html`<div class="f"><label>Workers</label><input type="number" name="workers" min="0" max="${cfg.max_workers}" value="${d.workers}">
+    <div class="hint">New workers are VMs that join the cluster; removed ones are drained first, the highest-numbered first.</div></div>`,
+    onOk: v => api(`${K8}/clusters/${enc(d.name)}`, {method: "PATCH", body: {workers: +v.workers}})});
+  if (r && r.job) { track(r, `Scale ${d.name}`); route(true); }
+};
+ACT["k8s-sync"] = async d => {
+  const r = await api(`${K8}/clusters/${enc(d.name)}/sync${tq(d.tenant)}`, {method: "POST"});
+  toast(r.log && r.log.length ? r.log.join(" · ") : "Nothing to change"); route(true);
+};
+
+/* ---------------------------------------------------------------- the edge: floating IPs, campus ports, extra addresses */
+async function edgeTargets() {        // what a port or floating IP can point at: VMs, and extra addresses
+  const [vms, ips] = await Promise.all([api("/tenant/vms"), api("/tenant/ips")]);
+  return [...vms.filter(v => v.status === "active").map(v => ({v: v.name, l: `${v.name} (${v.ip || "?"})`})),
+          ...ips.map(i => ({v: i.ip, l: `${i.ip} (extra${i.note ? ": " + i.note : ""})`}))];
+}
+const targetSelect = (ts, cur, optional) => html`<select name="target">${optional ? html`<option value="">— not now —</option>` : ""}
+  ${ts.map(t => html`<option value="${t.v}" ${t.v === cur ? "selected" : ""}>${t.l}</option>`)}</select>`;
+async function edgePage() {
+  if (role() === "auditor") {
+    const pool = await api("/carrier/floating-ips");
+    return html`${pageHead("Edge addresses", "", "Carrier")}${note("The floating IP pool of the main PC's campus side (FLOATING_POOL), and what each address carries.")}
+      ${tcard("", "", table([{h: "Floating IP", f: f => html`<span class="mono">${f.ip}</span>`}, {h: "Tenant", f: f => f.tenant || html`<span class="muted">free</span>`},
+        {h: "Attached to", f: f => f.target ? `${f.target} (${f.address})` : "—"}], pool, {empty: "The pool is empty (FLOATING_POOL in cluster.conf)."}))}`;
+  }
+  const P0 = isProv() ? "/provider" : "/tenant";
+  const [fips, ports, ips, me] = await Promise.all([api(`${P0}/floating-ips`), api(`${P0}/ports`), api(`${P0}/ips`), isCons() ? api("/tenant/me") : null]);
+  const u = me && me.usage, qq = me && me.quota;
+  const T_ = !isCons() ? [{h: "Tenant", f: x => x.tenant || html`<span class="muted">free</span>`}] : [];
+  return html`${pageHead(isCons() ? "External access" : "Edge addresses", btn("Refresh", "refresh", {icon: "refresh", cls: "flat"}), isCons() ? "Networking" : "Infrastructure")}
+    ${isCons() ? html`<div class="grid"><div class="card"><h2>In use</h2>${quotaBar("Floating IPs", u.floating_ips, qq.max_floating_ips)}${quotaBar("Campus ports", u.ports, qq.max_ports)}
+      ${quotaBar("Extra addresses", u.ips, qq.max_ips)}<div class="small muted">Set by the provider.</div></div>
+      <div class="card"><h2>How they differ</h2><p class="small"><b>Floating IP</b>: a campus address of a VM's own, every port, and its own traffic leaves from it.
+        <b>Campus port</b>: one port of the lab PC's address forwarded to one port of a VM. <b>Extra address</b>: an address of my subnet that no VM gets by itself,
+        for a service address (Kubernetes LoadBalancer) or a second address inside a VM; ports and floating IPs can point at it.</p></div></div>` : ""}
+    <div class="card p0"><div class="ch"><h2>Floating IPs</h2>${isCons() ? btn("Book a floating IP", "fip-new", {icon: "add", cls: "flat sm", disabled: u.floating_ips >= qq.max_floating_ips}) : ""}</div>
+      ${table([{h: "Floating IP", f: f => copyLine(f.ip)}, ...T_, {h: "Attached to", f: f => f.target ? html`<b>${f.target}</b> <span class="muted mono small">${f.address || ""}</span>` : html`<span class="muted">not attached</span>`},
+        {h: "", cls: "act", f: f => f.tenant ? html`${isCons() ? ibtn("hub", "fip-assoc", "Attach", {ip: f.ip, target: f.target || ""}) : ""}
+          ${ibtn("close", "fip-dissoc", "Detach", {ip: f.ip}, !f.target)}${ibtn("del", "fip-release", "Give back", {ip: f.ip})}` : ""}],
+        fips, {empty: "None. A floating IP needs FLOATING_POOL on the provider's side."})}</div>
+    <div class="card p0"><div class="ch"><h2>Campus ports</h2>${isCons() ? btn("Open a port", "port-new", {icon: "add", cls: "flat sm", disabled: u.ports >= qq.max_ports}) : ""}</div>
+      ${table([{h: "Connect to", f: p => copyLine(p.connect)}, {h: "Protocol", f: p => p.protocol}, ...T_, {h: "Goes to", f: p => html`<b>${p.target}</b>:${p.port} <span class="muted mono small">${p.address || ""}</span>`},
+        {h: "", cls: "act", f: p => ibtn("del", "port-del", "Close", {port: p.campus_port})}], ports, {empty: "None."})}</div>
+    <div class="card p0"><div class="ch"><h2>Extra addresses</h2>${isCons() ? btn("Reserve an address", "ip-new", {icon: "add", cls: "flat sm", disabled: u.ips >= qq.max_ips}) : ""}</div>
+      ${table([{h: "Address", f: i => html`<span class="mono">${i.ip}</span>`}, ...T_, {h: "Note", f: i => i.note || "—"}, {h: "Floating IP", f: i => i.floating_ip || "—"},
+        {h: "Campus ports", f: i => i.ports.join(", ") || "—"}, {h: "", cls: "act", f: i => ibtn("del", "ip-del", "Release", {ip: i.ip})}], ips, {empty: "None."})}</div>`;
+}
+const edgeSide = () => isProv() ? "/provider" : "/tenant";
+ACT["fip-new"] = async () => {
+  const ts = await edgeTargets();
+  const r = await modal({title: "Book a floating IP", ok: "Book", body: html`<div class="f"><label>Attach to</label>${targetSelect(ts, "", true)}
+    <div class="hint">Every port of it is reachable from campus at the floating IP, and its own connections leave from it.</div></div>`,
+    onOk: v => api("/tenant/floating-ips", {method: "POST", body: v.target ? {target: v.target} : {}})});
+  if (r && r.ip) { toast(`Floating IP ${r.ip}${r.target ? " → " + r.target : ""}`); route(true); }
+};
+ACT["fip-assoc"] = async d => {
+  const ts = await edgeTargets();
+  if (await modal({title: `Attach ${d.ip}`, ok: "Attach", body: html`<div class="f"><label>To</label>${targetSelect(ts, d.target)}</div>`,
+    onOk: v => api(`/tenant/floating-ips/${enc(d.ip)}/associate`, {method: "POST", body: {target: v.target}})})) { toast(`${d.ip} attached`); route(true); }
+};
+ACT["fip-dissoc"] = async d => { await api(`${edgeSide()}/floating-ips/${enc(d.ip)}/disassociate`, {method: "POST"}); toast(`${d.ip} detached`); route(true); };
+ACT["fip-release"] = async d => {
+  if (!await confirmDlg(`Give ${d.ip} back?`, "The address goes back to the pool; someone else may get it next.", "Give back")) return;
+  await api(`${edgeSide()}/floating-ips/${enc(d.ip)}`, {method: "DELETE"}); toast(`${d.ip} given back`); route(true);
+};
+ACT["port-new"] = async () => {
+  const ts = await edgeTargets();
+  const r = await modal({title: "Open a campus port", ok: "Open", body: html`<div class="f"><label>To</label>${targetSelect(ts)}</div>
+    <div class="f row"><div><label class="flabel">Port</label><input class="inp" type="number" name="port" min="1" max="65535" placeholder="e.g. 80"></div>
+      <div><label class="flabel">Protocol</label><select class="inp" name="protocol"><option>tcp</option><option>udp</option></select></div></div>
+    <div class="hint">The lab PC gets a free port of its own (47000-47999) that leads to this one.</div>`,
+    onOk: v => api("/tenant/ports", {method: "POST", body: {target: v.target, port: +v.port, protocol: v.protocol}})});
+  if (r && r.connect) { await modal({title: "Port open", ok: "", cancel: "Close", body: html`${kv([["From campus", copyLine(r.connect)], ["Goes to", `${r.target}:${r.port}/${r.protocol}`]])}`}); route(true); }
+};
+ACT["port-del"] = async d => {
+  if (!await confirmDlg(`Close campus port ${d.port}?`, "Connections to it stop.", "Close")) return;
+  await api(`${edgeSide()}/ports/${enc(d.port)}`, {method: "DELETE"}); toast(`Port ${d.port} closed`); route(true);
+};
+ACT["ip-new"] = async () => {
+  const r = await modal({title: "Reserve an extra address", ok: "Reserve", body: html`
+    <div class="f"><label>Address</label><input type="text" name="ip" placeholder="automatic: the next free one"></div>
+    <div class="f"><label>Note</label><input type="text" name="note" placeholder="e.g. metallb (one word)"></div>`,
+    onOk: v => api("/tenant/ips", {method: "POST", body: Object.fromEntries(Object.entries({ip: v.ip.trim(), note: v.note.trim()}).filter(([, x]) => x))})});
+  if (r && r.ip) { toast(`Reserved ${r.ip}`); route(true); }
+};
+ACT["ip-del"] = async d => {
+  if (!await confirmDlg(`Release ${d.ip}?`, "Its campus ports close and its floating IP is detached.", "Release")) return;
+  await api(`${edgeSide()}/ips/${enc(d.ip)}`, {method: "DELETE"}); toast(`${d.ip} released`); route(true);
+};
+
 /* ================================================================= the pages of each role */
+// the pages of the add-ons and the edge (their menu entries show only when they are there)
+const EXTRA = {"/containers": containersPage, "/containers/new": containerCreate, "/containers/stacks": stacksPage, "/containers/hosts": ctrHostsPage,
+  "/k8s": clustersPage, "/k8s/:name": clusterDetail, "/edge": edgePage};
 const VIEWS = {
   consumer: {"/": dashConsumer, "/vms": vmList, "/vms/new": vmCreate, "/vms/:name": vmDetail, "/images": imagesPage,
     "/network": networkPage, "/tunnels": tunnelsPage, "/access": accessPage, "/keys": keysPage, "/consoles": consolesPage, "/jobs": jobsPage,
     "/billing": billingOverview, "/billing/reports": billingReports, "/billing/invoices": invoicesPage, "/billing/invoices/:month": invoiceView,
-    "/billing/pricing": pricingPage, "/iam": iamPage},
+    "/billing/pricing": pricingPage, "/iam": iamPage, ...EXTRA},
   provider: {"/": dashProvider, "/tenants": tenantsPage, "/tenants/:name": tenantDetail, "/users": usersPage, "/unmanaged": unmanagedPage,
     "/vms": vmList, "/vms/:name": vmDetail, "/images": imagesPage, "/flavors": flavorsPage, "/nodes": nodesPage, "/hosts": hostsPage,
     "/underlay": underlayPage, "/tunnels": tunnelsPage, "/jobs": jobsPage, "/billing": billingOverview, "/billing/reports": billingReports,
-    "/billing/invoices": invoicesPage, "/billing/invoices/:month": invoiceView, "/audit": auditPage, "/audit/reports": auditReportsPage, "/journal": journalPage},
+    "/billing/invoices": invoicesPage, "/billing/invoices/:month": invoiceView, "/audit": auditPage, "/audit/reports": auditReportsPage, "/journal": journalPage, ...EXTRA},
   auditor: {"/": dashAuditor, "/audit": auditPage, "/audit/reports": auditReportsPage, "/journal": journalPage, "/underlay": underlayPage,
-    "/billing": billingOverview, "/billing/reports": billingReports, "/billing/invoices": invoicesPage, "/billing/invoices/:month": invoiceView},
+    "/billing": billingOverview, "/billing/reports": billingReports, "/billing/invoices": invoicesPage, "/billing/invoices/:month": invoiceView, ...EXTRA},
 };
 
 fetch("config.json").then(r => r.ok ? r.json() : {}).catch(() => ({})).then(c => {
