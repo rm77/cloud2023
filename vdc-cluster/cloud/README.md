@@ -255,7 +255,7 @@ That story is onboarding, isolation, quotas, a failing job, metering, the audito
 extra addresses, ports and floating IPs:
 
 ```sh
-sudo ./cluster.sh cloud install --dev && sudo ./cluster.sh cloud test     # 55 passed
+sudo ./cluster.sh cloud install --dev && sudo ./cluster.sh cloud test     # 56 passed
 ```
 
 ## What is not here yet (needs small changes to the kit)

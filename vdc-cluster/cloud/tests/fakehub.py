@@ -195,7 +195,7 @@ class FakeHub:
             if name.startswith("boom"):
                 raise labhub.LabError("no Ready node has 512 MB free")
             net = IPv4Network(self.tenants[t][1])
-            used = {v["ip"] for v in self.vms.values() if v["tenant"] == t}
+            used = {v["ip"] for v in self.vms.values() if v["tenant"] == t} | {a for a, r in self.extips.items() if r[0] == t}
             ip = opt.get("--ip") or next(str(h) for h in list(net.hosts())[9:] if str(h) not in used)
             node = min(self.nodes, key=lambda n: sum(1 for v in self.vms.values() if v["node"] == n[0]))[0]
             self.vms[name] = dict(tenant=t, node=node, image=opt.get("--image", "cirros"), ip=ip,

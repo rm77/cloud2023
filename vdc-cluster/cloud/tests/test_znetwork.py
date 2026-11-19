@@ -50,6 +50,15 @@ def test_extra_addresses(client, hub):
     assert client.get("/tenant/me", headers=H["nina"]).json()["usage"]["ips"] == 2
 
 
+def test_a_new_vm_never_gets_an_extra_address(client, hub):
+    extra = {i["ip"] for i in client.get("/tenant/ips", headers=H["nina"]).json()}
+    assert client.post("/tenant/vms", headers=H["nina"], json={"name": "n5"}).status_code == 202
+    run_jobs()
+    assert client.get("/tenant/vms/n5", headers=H["nina"]).json()["ip"] not in extra
+    assert client.delete("/tenant/vms/n5", headers=H["nina"]).status_code == 202
+    run_jobs()
+
+
 def test_campus_ports(client, hub):
     syncs = getattr(hub, "edge_syncs", 0)
     r = client.post("/tenant/ports", headers=H["nina"], json={"target": "n1", "port": 80})

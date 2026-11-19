@@ -5,6 +5,7 @@ of vdc-cluster. Browser and API then share one origin, so the kit's API needs no
     python3 portal.py --api http://<lab-pc>:36100            # console on http://<this host>:8080/
     python3 portal.py --api http://<lab-pc>:36100 --port 8090 --bind 127.0.0.1
     python3 portal.py --api http://<lab-pc>:36100 --meter-config metrics.json   # with vdc_meter.py
+    python3 portal.py --api http://<lab-pc>:36100 --addon containers=http://127.0.0.1:8091   # add-on services
 
 Python 3.8+ standard library only: nothing to install.
 Web consoles (ttyd, WebSocket) and /docs are not passed through: the browser opens them on the
@@ -41,6 +42,7 @@ class Handler(BaseHTTPRequestHandler):
     api = ""
     public = ""
     meter_cfg = None                                                  # from --meter-config
+    addons = {}                                                       # --addon NAME=URL: /addon/NAME/... -> URL
     whoami = {}                                                       # token -> (expires, /auth/me)
     timeout = 120
     server_version = "vdc-portal"
@@ -69,10 +71,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, json.dumps({"api": self.public}).encode(), "application/json")
         return self.send(404, b'{"detail":"not found"}', "application/json")
 
-    def proxy(self):
+    def proxy(self, base=None, what="the cloud API"):
+        base = base or self.api
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else None
-        req = urllib.request.Request(self.api + self.path, data=body, method=self.command)
+        req = urllib.request.Request(base + self.path, data=body, method=self.command)
         for k in PASS_HEADERS:
             if self.headers.get(k):
                 req.add_header(k, self.headers[k])
@@ -83,7 +86,7 @@ class Handler(BaseHTTPRequestHandler):
             code, data, hdrs = e.code, e.read(), e.headers
         except (urllib.error.URLError, OSError) as e:
             reason = getattr(e, "reason", e)
-            msg = json.dumps({"detail": f"portal: the cloud API at {self.api} does not answer ({reason})"})
+            msg = json.dumps({"detail": f"portal: {what} at {base} does not answer ({reason})"})
             return self.send(502, msg.encode(), "application/json")
         self.send_response(code)
         for k in BACK_HEADERS:
@@ -144,6 +147,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith(API_PREFIXES):
             return self.proxy()
         if self.path.startswith("/addon/"):
+            name = self.path[len("/addon/"):].split("/")[0].split("?")[0]
+            if name in self.addons:                  # an add-on service: passed on as it is, token and all
+                return self.proxy(self.addons[name], f"the add-on {name}")
+            if self.path.split("?")[0] == "/addon/addons":
+                return self.send(200, json.dumps(sorted(self.addons)).encode(), "application/json")
             return self.addon()
         if self.command in ("GET", "HEAD"):
             return self.page()
@@ -162,8 +170,16 @@ def main():
     ap.add_argument("--port", type=int, default=int(os.environ.get("VDC_PORTAL_PORT", "8080")))
     ap.add_argument("--meter-config", default=os.environ.get("VDC_METER_CONFIG", ""),
                     help="metrics.json of vdc_meter.py: show the add-on charges in the console")
+    ap.add_argument("--addon", action="append", default=[], metavar="NAME=URL",
+                    help="an add-on service: /addon/NAME/... is passed on to URL (e.g. containers=http://127.0.0.1:8091); "
+                         "repeat for more")
     ap.add_argument("--quiet", action="store_true", help="no request log")
     a = ap.parse_args()
+    for spec in a.addon + [s for s in os.environ.get("VDC_PORTAL_ADDONS", "").split(",") if s]:
+        name, _, url = spec.partition("=")
+        if not name or not url.startswith("http") or name in ("metrics", "usage", "addons"):
+            ap.error(f"--addon {spec}: NAME=http://host:port (not metrics, usage or addons)")
+        Handler.addons[name] = url.rstrip("/")
     if a.meter_config:
         Handler.meter_cfg = vdc_meter.load_config(a.meter_config)
     Handler.api = a.api.rstrip("/")
@@ -171,7 +187,8 @@ def main():
     srv = ThreadingHTTPServer((a.bind, a.port), Handler)
     srv.quiet = a.quiet
     print(f"vdc-portal on http://{a.bind}:{a.port}/  ->  API {Handler.api}  (browsers open consoles on {Handler.public})"
-          + (f"; add-on meter {Handler.meter_cfg['db']}" if Handler.meter_cfg else ""), flush=True)
+          + (f"; add-on meter {Handler.meter_cfg['db']}" if Handler.meter_cfg else "")
+          + "".join(f"; /addon/{n} -> {u}" for n, u in Handler.addons.items()), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

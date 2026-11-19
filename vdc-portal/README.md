@@ -39,6 +39,7 @@ password from `sudo ./cluster.sh cloud admin`), a tenant user, or an auditor.
 | `--bind` | `0.0.0.0` | address to listen on |
 | `--port` | `8080` | port to listen on |
 | `--meter-config` | `$VDC_METER_CONFIG` | `metrics.json` of `vdc_meter.py`: show its charges in the console |
+| `--addon NAME=URL` | `$VDC_PORTAL_ADDONS` (comma-separated) | an add-on service, e.g. `containers=http://127.0.0.1:8091` (vdc-containers) or `k8s=http://127.0.0.1:8092` (vdc-k8s): `/addon/NAME/...` is passed on to it; repeat for more |
 | `--quiet` | | no request log |
 
 Why a small server and not just the file: the API sends no CORS headers, so a browser lets a page

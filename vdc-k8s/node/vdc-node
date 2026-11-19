@@ -1,0 +1,79 @@
+#!/bin/sh
+# vdc-node: what vdc-k8s runs on a Kubernetes node, as root over SSH. Installed to
+# /usr/local/bin/vdc-node by vdc-k8s before node-setup.sh. The commands other than check
+# are for the control-plane node (the k3s server).
+#
+#   vdc-node check                 "ok k3s <version>"
+#   vdc-node token                 the join token for workers
+#   vdc-node kubeconfig            the admin kubeconfig (server https://127.0.0.1:6443)
+#   vdc-node kubectl ARGS...       k3s kubectl, 120 s at most
+#   vdc-node services              every Service, as JSON
+#   vdc-node nodes                 NAME<tab>STATUS<tab>ROLES<tab>VERSION of each node
+#   vdc-node metallb VERSION ADDR...   install MetalLB (L2) with ADDR/32 as its address pool
+#   vdc-node pool ADDR...          set the pool again
+#   vdc-node remove NODE           drain a node and delete it from the cluster
+set -eu
+die() { echo "vdc-node: $*" >&2; exit 1; }
+KC="k3s kubectl"
+SHARE=/usr/local/share/vdc
+
+pool() {
+  [ $# -gt 0 ] || die "pool: no addresses"
+  y="apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata: {name: vdc, namespace: metallb-system}
+spec:
+  addresses:"
+  for a in "$@"; do y="$y
+  - $a/32"; done
+  y="$y
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata: {name: vdc, namespace: metallb-system}
+spec: {ipAddressPools: [vdc]}"
+  # the webhook answers only some seconds after the controller is ready
+  i=0
+  until printf '%s\n' "$y" | $KC apply -f - 2>/tmp/vdc-pool.err; do
+    i=$((i + 1)); [ $i -lt 30 ] || { cat /tmp/vdc-pool.err >&2; die "MetalLB did not take the address pool"; }
+    sleep 5
+  done
+}
+
+case ${1:-} in
+  check)
+    command -v k3s >/dev/null || die "k3s is not installed"
+    echo "ok k3s $(k3s --version | head -n 1 | awk '{print $3}')" ;;
+  token)
+    cat /var/lib/rancher/k3s/server/node-token ;;
+  kubeconfig)
+    cat /etc/rancher/k3s/k3s.yaml ;;
+  kubectl)
+    shift
+    exec timeout 120 $KC "$@" ;;
+  services)
+    exec $KC get svc -A -o json ;;
+  nodes)
+    $KC get nodes --no-headers -o custom-columns='N:.metadata.name,S:.status.conditions[?(@.type=="Ready")].status,R:.metadata.labels.node-role\.kubernetes\.io/control-plane,V:.status.nodeInfo.kubeletVersion' |
+      awk '{printf "%s\t%s\t%s\t%s\n", $1, ($2 == "True" ? "Ready" : "NotReady"), ($3 == "true" ? "control-plane" : "worker"), $4}' ;;
+  metallb)
+    [ $# -ge 3 ] || die "metallb VERSION ADDR..."
+    v=$2; shift 2
+    m=$SHARE/metallb-native-$v.yaml        # baked into the image (image/), or fetched now
+    [ -s "$m" ] || m=https://raw.githubusercontent.com/metallb/metallb/$v/config/manifests/metallb-native.yaml
+    echo "installing MetalLB $v"
+    $KC apply -f "$m" >/dev/null
+    $KC -n metallb-system wait --for=condition=Available deploy/controller --timeout=300s >/dev/null ||
+      die "the MetalLB controller did not start (images pulled from quay.io: internet?)"
+    pool "$@"
+    echo "MetalLB $v: address pool $*" ;;
+  pool)
+    shift
+    pool "$@" ;;
+  remove)
+    [ $# -eq 2 ] || die "remove NODE"
+    $KC drain "$2" --ignore-daemonsets --delete-emptydir-data --force --timeout=120s >/dev/null 2>&1 || true
+    $KC delete node "$2" --ignore-not-found ;;
+  *)
+    die "usage: vdc-node check|token|kubeconfig|kubectl|services|nodes|metallb|pool|remove ..." ;;
+esac

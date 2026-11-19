@@ -26,15 +26,18 @@ class PortalTest(unittest.TestCase):
         cls.api = ThreadingHTTPServer(("127.0.0.1", 0), FakeApi)
         threading.Thread(target=cls.api.serve_forever, daemon=True).start()
         cls.port = free_port()
+        cls.addon = ThreadingHTTPServer(("127.0.0.1", 0), FakeApi)        # an add-on service answers the same way
+        threading.Thread(target=cls.addon.serve_forever, daemon=True).start()
         cls.proc = subprocess.Popen([sys.executable, "portal.py", "--api", f"http://127.0.0.1:{cls.api.server_port}",
-                                     "--public-api", "http://lab-pc:36100", "--bind", "127.0.0.1", "--port", str(cls.port), "--quiet"])
+                                     "--public-api", "http://lab-pc:36100", "--bind", "127.0.0.1", "--port", str(cls.port), "--quiet",
+                                     "--addon", f"containers=http://127.0.0.1:{cls.addon.server_port}"])
         for _ in range(50):
             try: socket.create_connection(("127.0.0.1", cls.port), 0.2).close(); break
             except OSError: time.sleep(0.1)
 
     @classmethod
     def tearDownClass(cls):
-        cls.proc.terminate(); cls.proc.wait(); cls.api.shutdown()
+        cls.proc.terminate(); cls.proc.wait(); cls.api.shutdown(); cls.addon.shutdown()
 
     def call(self, path, method="GET", data=None, headers={}):
         req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method, headers=headers)
@@ -59,6 +62,15 @@ class PortalTest(unittest.TestCase):
                                    {"Content-Type": "application/x-www-form-urlencoded"})[0], 200)
         self.assertEqual(self.call("/tenant/keys/x", "DELETE")[0], 204)
         self.assertEqual(self.call("/provider/missing")[0], 404)       # the API's errors come back as they are
+
+    def test_addon_services_pass_through(self):
+        code, body, _ = self.call("/addon/containers/web/logs?tail=5", headers={"Authorization": "Bearer t0k"})
+        r = json.loads(body)
+        self.assertEqual((code, r["path"], r["auth"]), (200, "/addon/containers/web/logs?tail=5", "Bearer t0k"))
+        code, body, _ = self.call("/addon/containers", "POST", b'{"name":"web"}', {"Content-Type": "application/json"})
+        self.assertEqual((code, json.loads(body)["body"]), (200, '{"name":"web"}'))
+        self.assertEqual(json.loads(self.call("/addon/addons")[1]), ["containers"])
+        self.assertEqual(self.call("/addon/k8s/clusters")[0], 404)       # not configured: the portal's own 404
 
     def test_api_down(self):
         self.api_port = self.api.server_port
