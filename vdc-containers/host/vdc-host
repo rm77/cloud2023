@@ -1,0 +1,96 @@
+#!/bin/sh
+# vdc-host: what vdc-containers runs on a container host, as root over SSH.
+# Installed to /usr/local/bin/vdc-host by host-setup.sh. Every container and stack the add-on
+# makes carries the label vdc.managed=1.
+#
+#   vdc-host check                      "ok docker <version>"
+#   vdc-host run DOCKER-RUN-ARGS...     docker run -d with these options, image and command
+#   vdc-host rm|start|stop|restart NAME
+#   vdc-host logs NAME [LINES]
+#   vdc-host exec NAME CMD...           (30 s at most)
+#   vdc-host ps                         NAME<tab>STATE<tab>STATUS of every managed container
+#   vdc-host stats                      NAME<tab>CPU%<tab>MEMORY of every running container
+#   vdc-host addr add ADDR/PREFIX       an extra address on the network card, kept over reboots
+#   vdc-host addr del ADDR[/PREFIX]
+#   vdc-host addr restore               (at boot)
+#   vdc-host stack up NAME              compose.yaml on stdin -> docker compose up -d
+#   vdc-host stack down|ps NAME, vdc-host stack logs NAME [LINES]
+set -eu
+STACKS=/var/lib/vdc/stacks
+ADDRS=/etc/vdc/addrs
+
+die() { echo "vdc-host: $*" >&2; exit 1; }
+nic() { ip -o -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}'; }
+need() { [ $# -ge "$1" ] || die "$2"; }
+
+case ${1:-} in
+  check)
+    command -v docker >/dev/null || die "docker is not installed"
+    v=$(docker version --format '{{.Server.Version}}' 2>/dev/null) || die "dockerd is not running"
+    docker compose version >/dev/null 2>&1 || die "docker compose is not installed"
+    echo "ok docker $v" ;;
+  run)
+    shift
+    exec docker run -d "$@" ;;
+  rm)
+    need $# 2 "rm NAME"
+    docker rm -f "$2" >/dev/null 2>&1 || true ;;
+  start|stop|restart)
+    need $# 2 "$1 NAME"
+    docker "$1" "$2" >/dev/null ;;
+  logs)
+    need $# 2 "logs NAME [LINES]"
+    exec docker logs --tail "${3:-100}" --timestamps "$2" 2>&1 ;;
+  exec)
+    need $# 3 "exec NAME CMD..."
+    shift; n=$1; shift
+    exec timeout 30 docker exec "$n" "$@" ;;
+  ps)
+    docker ps -a --filter label=vdc.managed=1 --format '{{.Names}}	{{.State}}	{{.Status}}' ;;
+  stats)
+    docker stats --no-stream --format '{{.Name}}	{{.CPUPerc}}	{{.MemUsage}}' ;;
+  addr)
+    need $# 2 "addr add|del ADDR/PREFIX | addr restore"
+    mkdir -p "${ADDRS%/*}"; touch "$ADDRS"
+    d=$(nic); [ -n "$d" ] || die "no default route: which network card?"
+    case $2 in
+      add)
+        need $# 3 "addr add ADDR/PREFIX"
+        ip -4 addr show dev "$d" | grep -q " ${3%/*}/" || ip addr add "$3" dev "$d"
+        grep -qxF "$3" "$ADDRS" || echo "$3" >>"$ADDRS" ;;
+      del)
+        need $# 3 "addr del ADDR[/PREFIX]"
+        a=$3
+        case $a in */*) ;; *) a=$(grep "^$a/" "$ADDRS" | head -n 1); a=${a:-$3/32} ;; esac
+        ip addr del "$a" dev "$d" 2>/dev/null || true
+        grep -vxF "$a" "$ADDRS" >"$ADDRS.tmp" || true
+        mv "$ADDRS.tmp" "$ADDRS" ;;
+      restore)
+        while read -r a; do
+          [ -n "$a" ] || continue
+          ip -4 addr show dev "$d" | grep -q " ${a%/*}/" || ip addr add "$a" dev "$d" || true
+        done <"$ADDRS" ;;
+      *) die "addr add|del|restore" ;;
+    esac ;;
+  stack)
+    need $# 3 "stack up|down|ps|logs NAME"
+    n=$3 d=$STACKS/$3
+    case $2 in
+      up)
+        mkdir -p "$d"
+        cat >"$d/compose.yaml"
+        cd "$d"
+        docker compose -p "$n" up -d --remove-orphans 2>&1 ;;
+      down)
+        if [ -d "$d" ]; then (cd "$d" && docker compose -p "$n" down -v 2>&1) || true; fi
+        rm -rf "$d" ;;
+      ps)
+        [ -d "$d" ] || exit 0
+        cd "$d" && docker compose -p "$n" ps -a --format '{{.Name}}	{{.State}}	{{.Status}}' ;;
+      logs)
+        cd "$d" && exec docker compose -p "$n" logs --tail "${4:-100}" --timestamps 2>&1 ;;
+      *) die "stack up|down|ps|logs NAME" ;;
+    esac ;;
+  *)
+    die "usage: vdc-host check|run|rm|start|stop|restart|logs|exec|ps|stats|addr|stack ..." ;;
+esac
