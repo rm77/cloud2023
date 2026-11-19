@@ -4,6 +4,7 @@ of vdc-cluster. Browser and API then share one origin, so the kit's API needs no
 
     python3 portal.py --api http://<lab-pc>:36100            # console on http://<this host>:8080/
     python3 portal.py --api http://<lab-pc>:36100 --port 8090 --bind 127.0.0.1
+    python3 portal.py --api http://<lab-pc>:36100 --meter-config metrics.json   # with vdc_meter.py
 
 Python 3.8+ standard library only: nothing to install.
 Web consoles (ttyd, WebSocket) and /docs are not passed through: the browser opens them on the
@@ -13,9 +14,14 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vdc_meter  # noqa: E402  (the add-on meter's report, for /addon/usage)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 API_PREFIXES = ("/auth/", "/tenant/", "/provider/", "/audit/", "/carrier/")
@@ -34,6 +40,8 @@ OPENER = urllib.request.build_opener(NoRedirect)
 class Handler(BaseHTTPRequestHandler):
     api = ""
     public = ""
+    meter_cfg = None                                                  # from --meter-config
+    whoami = {}                                                       # token -> (expires, /auth/me)
     timeout = 120
     server_version = "vdc-portal"
 
@@ -86,9 +94,57 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(data)
 
+    def me(self):
+        """who is calling: the API answers /auth/me for the caller's own token (kept a minute)"""
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return None
+        hit = Handler.whoami.get(auth)
+        if hit and hit[0] > time.time():
+            return hit[1]
+        try:
+            with OPENER.open(urllib.request.Request(self.api + "/auth/me", headers={"Authorization": auth}), timeout=30) as r:
+                me = json.loads(r.read())
+        except urllib.error.HTTPError:
+            return None
+        if len(Handler.whoami) > 1000:
+            Handler.whoami.clear()
+        Handler.whoami[auth] = (time.time() + 60, me)
+        return me
+
+    def addon(self):
+        """the add-on meter's charges (vdc_meter.py); tenant users see only their own tenant"""
+        jsend = lambda code, obj: self.send(code, json.dumps(obj).encode(), "application/json")
+        if self.meter_cfg is None:
+            return jsend(404, {"detail": "no add-on meter: start portal.py with --meter-config"})
+        if self.command not in ("GET", "HEAD"):
+            return jsend(405, {"detail": "method not allowed"})
+        try:
+            me = self.me()
+        except (urllib.error.URLError, OSError) as e:
+            return jsend(502, {"detail": f"portal: the cloud API at {self.api} does not answer ({e})"})
+        if not me:
+            return jsend(401, {"detail": "log in first"})
+        path, _, qs = self.path.partition("?")
+        q = {k: v[-1] for k, v in urllib.parse.parse_qs(qs).items()}
+        if path == "/addon/metrics":
+            return jsend(200, {"interval_minutes": self.meter_cfg["interval_minutes"],
+                               "metrics": vdc_meter.public_metrics(self.meter_cfg)})
+        if path == "/addon/usage":
+            tenant = me.get("tenant") if me.get("role") == "consumer" else (q.get("tenant") or None)
+            if me.get("role") == "consumer" and not tenant:
+                return jsend(403, {"detail": "no tenant"})
+            try:
+                return jsend(200, vdc_meter.report(self.meter_cfg, q.get("since"), q.get("until"), tenant))
+            except ValueError as e:
+                return jsend(422, {"detail": f"bad date: {e}"})
+        return jsend(404, {"detail": "not found"})
+
     def route(self):
         if self.path.startswith(API_PREFIXES):
             return self.proxy()
+        if self.path.startswith("/addon/"):
+            return self.addon()
         if self.command in ("GET", "HEAD"):
             return self.page()
         return self.send(405, b'{"detail":"method not allowed"}', "application/json")
@@ -104,13 +160,18 @@ def main():
                     help="the API as browsers reach it, for web consoles and /docs (default: same as --api)")
     ap.add_argument("--bind", default=os.environ.get("VDC_PORTAL_BIND", "0.0.0.0"))
     ap.add_argument("--port", type=int, default=int(os.environ.get("VDC_PORTAL_PORT", "8080")))
+    ap.add_argument("--meter-config", default=os.environ.get("VDC_METER_CONFIG", ""),
+                    help="metrics.json of vdc_meter.py: show the add-on charges in the console")
     ap.add_argument("--quiet", action="store_true", help="no request log")
     a = ap.parse_args()
+    if a.meter_config:
+        Handler.meter_cfg = vdc_meter.load_config(a.meter_config)
     Handler.api = a.api.rstrip("/")
     Handler.public = (a.public_api or a.api).rstrip("/")
     srv = ThreadingHTTPServer((a.bind, a.port), Handler)
     srv.quiet = a.quiet
-    print(f"vdc-portal on http://{a.bind}:{a.port}/  ->  API {Handler.api}  (browsers open consoles on {Handler.public})", flush=True)
+    print(f"vdc-portal on http://{a.bind}:{a.port}/  ->  API {Handler.api}  (browsers open consoles on {Handler.public})"
+          + (f"; add-on meter {Handler.meter_cfg['db']}" if Handler.meter_cfg else ""), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

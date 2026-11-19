@@ -12,6 +12,11 @@ It is separate from the kit and changes nothing in it: it uses the API's endpoin
 | `index.html` | the console: one page, HTML and JavaScript, no build step, nothing loaded from the internet |
 | `portal.py` | serves the page and passes its API calls on to the cloud API (Python 3.8+, standard library only) |
 | `test_portal.py` | tests for `portal.py` against a stand-in API: `python3 test_portal.py` |
+| `vdc-passwd.sh` | sets the password of any API account, the provider's own included (main PC, root) |
+| `vdc_meter.py` | meters additional billing metrics through the API, at your own prices |
+| `metrics.json` | the metrics `vdc_meter.py` measures and their prices |
+| `examples/accounts.py` | a custom metric: user accounts per tenant |
+| `test_meter.py` | tests for `vdc_meter.py` and the console's `/addon/` calls: `python3 test_meter.py` |
 
 ## Running it
 
@@ -32,6 +37,7 @@ password from `sudo ./cluster.sh cloud admin`), a tenant user, or an auditor.
 | `--public-api` | `$VDC_API_PUBLIC`, else `--api` | the cloud API as browsers reach it |
 | `--bind` | `0.0.0.0` | address to listen on |
 | `--port` | `8080` | port to listen on |
+| `--meter-config` | `$VDC_METER_CONFIG` | `metrics.json` of `vdc_meter.py`: show its charges in the console |
 | `--quiet` | | no request log |
 
 Why a small server and not just the file: the API sends no CORS headers, so a browser lets a page
@@ -63,6 +69,28 @@ working until it expires (8 hours).
 Long operations (create, delete, power, image import, adding spokes) answer `202`. The console
 follows each job under the bell icon and reloads the page when the job ends.
 
+## Changing a password from the shell: vdc-passwd.sh
+
+The console's reset works for every account but the provider's own, because the API does not let
+an account delete itself. `vdc-passwd.sh` works for all of them, admin included. Run it on the
+main PC, as root. `-k` names the kit folder; without it the script uses `$VDC_KIT`, else the
+folder you are in:
+
+```sh
+sudo ./vdc-passwd.sh -k <kit> -l               # the accounts: user, role, tenant, admin
+sudo ./vdc-passwd.sh -k <kit> alice            # asks for the new password twice
+sudo ./vdc-passwd.sh -k <kit> -r tari          # a random password, printed once
+sudo ./vdc-passwd.sh -k <kit> admin            # the provider's own account
+```
+
+It writes a new hash, in the API's own format, into `state/cloud/cloud.db`, so the account keeps
+its role, tenant, admin flag and creation date, and it adds a `user.password` event to the audit
+log. For `admin` it also updates `state/cloud/admin-password`, so `sudo ./cluster.sh cloud admin`
+shows the new password. The API can keep running. It needs only `python3`, which the kit's cloud
+API needs anyway; nothing in the kit is changed.
+
+A login the user already has stays valid until it expires (8 hours).
+
 ## Billing
 
 - **Overview:** cost this month so far, a forecast for the month (so far, plus the VMs running
@@ -83,3 +111,84 @@ metering samples of that period.
 Prices are plain numbers in the API. The currency symbol is a console setting (account menu →
 Console settings), kept in the browser. The login token stays in the browser tab, so closing the
 tab logs out.
+
+## Additional metrics: vdc_meter.py
+
+The kit charges VM running hours at the machine type's price. `vdc_meter.py` adds charges for
+other things, defined in `metrics.json`, each with its own price. It gets its data from the cloud
+API and keeps its own database (`state/meter.db`), so the kit is not changed. The console shows
+the charges in the billing pages, on invoices and in the price lists, next to the VM hours.
+
+The kit's own reports (`/tenant/usage`, `/provider/usage`, `/audit/metering`) still show VM hours
+only; the additional metrics are in the console and in `vdc_meter.py --report`.
+
+### Running it
+
+The meter logs in as a provider account, because only the provider sees every VM through the
+API. Create one for it in the console (Accounts → Create account, role provider), then:
+
+```sh
+export VDC_METER_USER=meter VDC_METER_PASSWORD='<its password>'
+python3 vdc_meter.py --check          # one round, nothing saved: what each metric would charge
+python3 vdc_meter.py                  # every interval_minutes, until stopped
+python3 portal.py --api http://<lab-pc>:36100 --meter-config metrics.json
+```
+
+`--once` takes one round and exits, for cron or a systemd timer. `--password-file FILE` reads the
+password from a file instead of the environment. `--report --since 2026-11-01 --tenant tenant-a`
+prints the totals as JSON.
+
+Like the kit's meter, it counts what it sees on each round. While the meter is not running,
+nothing is metered.
+
+### metrics.json
+
+```json
+{
+  "api": "http://127.0.0.1:36100",
+  "interval_minutes": 5,
+  "db": "state/meter.db",
+  "metrics": [
+    {"name": "disk", "label": "Disk, allocated", "source": "vm", "value": "disk_gb",
+     "when": "always", "kind": "gauge", "per": "month", "unit": "GB-month", "price": 0.10}
+  ]
+}
+```
+
+| Field | Values | Meaning |
+|---|---|---|
+| `name` | letters, digits, `-`, `_` | the metric's id, unique |
+| `label`, `unit`, `description` | text | what the console and invoices show |
+| `source` | `vm`, `tunnels`, `tenant`, `command` | where the value comes from (below) |
+| `value` | see below | which number of the source |
+| `when` | `running`, `stopped`, `always` | for `vm` and `tenant`: which VMs count (default `running`) |
+| `kind` | `gauge`, `amount` | `gauge`: a level held over time (value × time); `amount`: used since the last round |
+| `per` | `hour`, `month` | for a gauge: the price is per unit-hour or per unit-month (730 h) |
+| `price` | number | per unit (per `unit`) |
+| `enabled` | `true`, `false` | off without deleting it |
+
+| `source` | `value` | gives |
+|---|---|---|
+| `vm` | `count`, `vcpus`, `mem_gb`, `disk_gb` | one value per VM (from `/provider/vms` and the machine type) |
+| `tunnels` | | the open tunnels of each VM (`/provider/tunnels`); `"protocol": "http"` counts one protocol only |
+| `tenant` | `count`, `internet`, `vms`, `vcpus`, `mem_gb`, `disk_gb` | one value per tenant (`/provider/tenants`), e.g. 1 while internet access is on |
+| `command` | | whatever a command prints (below) |
+
+Examples of what this covers: disk while a VM exists (stopped included), a price per vCPU-hour
+or per GB of RAM, public tunnels, internet access, a flat fee per tenant or per VM.
+
+### Your own metric: source command
+
+A `command` metric runs a command on every round and reads one line per value:
+`TENANT VM VALUE`, with `-` as VM for a value of the whole tenant. The command gets the meter's
+login in `VDC_API` and `VDC_TOKEN`, so it can ask the API for anything the provider sees.
+`examples/accounts.py` counts each tenant's user accounts (`/provider/users`) and is in
+`metrics.json` as the metric `accounts` (switched off; set `"enabled": true`).
+
+A command can measure things outside the API too, for example traffic counters from the nodes,
+with `"kind": "amount"`: then VALUE is what was used since the last round (GB, say), charged at
+`price` per unit. A command that fails is logged and that round skips it; the other metrics are
+still metered.
+
+Prices: each sample keeps the price it was charged at, so a new price in `metrics.json` applies
+from the meter's next start, and past charges stay as they were.

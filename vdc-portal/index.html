@@ -372,6 +372,40 @@ async function usage({since, until, tenant} = {}) {
   }
   return {since: since || a.since, until: until && T(until) < Date.now() ? until : a.until, lines, total_cost: R2(sum(lines, l => l.cost), 4)};
 }
+// The add-on meter (vdc_meter.py, served by portal.py at /addon/): extra metrics with their own
+// prices, next to the kit's VM hours. undefined = not asked yet, null = no meter configured.
+S.addon = undefined;
+async function addonDefs() {
+  if (S.addon !== undefined) return S.addon;
+  try { S.addon = await api("/addon/metrics"); }
+  catch (e) { if (e.status === 404) S.addon = null; else return null; }   // another error: ask again next time
+  return S.addon;
+}
+async function addonUsage({since, until, tenant} = {}) {
+  if (!await addonDefs()) return null;
+  const q = [];
+  if (since) q.push("since=" + enc(since));
+  if (until) q.push("until=" + enc(until));
+  if (tenant && !isCons()) q.push("tenant=" + enc(tenant));
+  return api("/addon/usage" + (q.length ? "?" + q.join("&") : ""));
+}
+const addonOk = a => a && !failed(a) ? a : null;               // the report, or null (none or failed)
+const addonCost = a => addonOk(a) ? a.total_cost : 0;
+const vmLabel = vm => vm === "-" ? "(tenant-wide)" : vm;
+// the rate of an add-on line: its configured price when the amounts agree with it, else what was charged
+function addonRate(l) {
+  if (!l.quantity) return "—";
+  const d = S.addon && S.addon.metrics.find(m => m.metric === l.metric || m.name === l.metric), r = l.cost / l.quantity;
+  return `${rate(d && Math.abs(d.price - r) <= Math.max(d.price * 0.01, 0.00005) ? d.price : r)} / ${l.unit}`;
+}
+// add the add-on's cost per day into a cost series (its buckets are a day or a week long)
+function withAddonDays(series, a) {
+  if (!addonOk(a) || failed(series)) return series;
+  const step = series.step * 86400000;
+  return {...series, points: series.points.map(p => ({...p, v: p.v + sum(a.days.filter(x => {
+    const t = Date.parse(x.date + "T00:00:00Z"); return t >= p.d.getTime() && t < p.d.getTime() + step; }), x => x.cost)}))};
+}
+
 // cost per bucket (a day, or a week for long periods) from start to end, by the same subtraction
 async function costSeries({since, until, tenant}) {
   const a = T(since), b = until ? T(until) : new Date();
@@ -563,7 +597,7 @@ function showLogin(msg = "") {
   };
 }
 function logout(msg) {
-  S.token = null; S.me = null; S.flavors = null; JOBS.length = 0;
+  S.token = null; S.me = null; S.flavors = null; S.addon = undefined; JOBS.length = 0;
   sessionStorage.removeItem("vdc.token"); $("#menu").classList.add("hidden");
   location.hash = ""; showLogin(msg);
 }
@@ -813,8 +847,10 @@ async function vmDetail({name}) {
   if (isProv()) { v = (await api("/provider/vms?state=true")).find(x => x.name === name); if (!v) throw new Error(`no VM ${name}`); }
   else v = await api(`/tenant/vms/${enc(name)}`);
   const f = flavorOf(v.flavor);
-  const [jobs, cost, tunnels] = await Promise.all([
-    soft(api(P.jobs() + "?limit=200")), soft(api(usageQ({since: monthRange(0).since, tenant: v.tenant}))), soft(api(P.tunnels()))]);
+  const [jobs, cost, tunnels, ad] = await Promise.all([
+    soft(api(P.jobs() + "?limit=200")), soft(api(usageQ({since: monthRange(0).since, tenant: v.tenant}))), soft(api(P.tunnels())),
+    soft(addonUsage({since: monthRange(0).since, tenant: v.tenant}))]);
+  const vmExtra = addonOk(ad) ? ad.lines.filter(l => l.vm === name) : [];
   const myJobs = failed(jobs) ? [] : jobs.filter(j => j.target === name).slice(0, 8);
   const line = failed(cost) ? null : cost.lines.find(l => l.vm === name && l.tenant === v.tenant);
   const myTunnels = failed(tunnels) ? [] : tunnels.filter(t => t.vm === name);
@@ -843,7 +879,8 @@ async function vmDetail({name}) {
                  {h: "", cls: "act", f: t => ibtn("close", "tunnel-close", "Close tunnel", {id: t.id})}], myTunnels, {empty: "No open tunnels for this VM."})}</div>
     </div><div>
       <div class="card"><h2>Cost this month</h2>
-        <div class="stat">${money(line ? line.cost : 0)}</div><div class="muted small">${line ? `${num(line.vm_hours)} running hours` : "no running hours metered yet"}</div>
+        <div class="stat">${money((line ? line.cost : 0) + sum(vmExtra, l => l.cost))}</div><div class="muted small">${line ? `${num(line.vm_hours)} running hours, ${money(line.cost)}` : "no running hours metered yet"}</div>
+        ${vmExtra.map(l => html`<div class="qrow small" style="margin-top:4px"><span>${l.label} (${num(l.quantity, 3)} ${l.unit})</span><span>${money(l.cost, 4)}</span></div>`)}
         <hr style="border:0;border-top:1px solid var(--line2);margin:14px 0">
         ${kv([["Rate", f ? `${rate(f.price_per_hour)} / hour` : "—"], ["Per month", f ? `≈ ${money(f.price_per_hour * HOURS_PER_MONTH)} (730 h)` : "—"]])}
         <p class="small muted">Only running hours are charged; a stopped VM costs nothing.</p></div>
@@ -932,12 +969,12 @@ function vmFormUpdate() {
 /* ================================================================= dashboards */
 async function dashConsumer() {
   const mtd = monthRange(0);
-  const [me, vms, use, fl, jobs] = await Promise.all([api("/tenant/me"), soft(api("/tenant/vms?state=true")),
-    soft(api(usageQ({since: mtd.since}))), flavors(), soft(api("/tenant/jobs?limit=6"))]);
-  const q = me.quota, u = me.usage;
+  const [me, vms, use, fl, jobs, ad] = await Promise.all([api("/tenant/me"), soft(api("/tenant/vms?state=true")),
+    soft(api(usageQ({since: mtd.since}))), flavors(), soft(api("/tenant/jobs?limit=6")), soft(addonUsage({since: mtd.since}))]);
+  const q = me.quota, u = me.usage, A = addonOk(ad);
   const running = failed(vms) ? [] : vms.filter(v => vmState(v) === "running");
-  const rateNow = sum(running, v => (flavorOf(v.flavor) || {}).price_per_hour);
-  const cost = failed(use) ? 0 : use.total_cost, forecast = cost + rateNow * hoursLeftInMonth();
+  const rateNow = sum(running, v => (flavorOf(v.flavor) || {}).price_per_hour) + (A ? A.rate_per_hour : 0);
+  const cost = (failed(use) ? 0 : use.total_cost) + addonCost(A), forecast = cost + rateNow * hoursLeftInMonth();
   return html`${pageHead(`Welcome, ${S.me.username}`, html`${btn("Create instance", "go", {icon: "add", data: {href: "#/vms/new"}})}`, html`Tenant ${me.display_name || me.name}`)}
   <div class="grid">
     <div class="card"><h2>Tenant info</h2>${kv([["Tenant", me.name], me.display_name && ["Name", me.display_name], ["VNI", me.vni],
@@ -963,11 +1000,11 @@ async function dashConsumer() {
 
 async function dashProvider() {
   const mtd = monthRange(0);
-  const [health, nodes, tenants, use, jobs] = await Promise.all([soft(api("/provider/health")), soft(api("/provider/nodes")),
-    soft(api("/provider/tenants")), soft(api(usageQ({since: mtd.since}))), soft(api("/provider/jobs?limit=6"))]);
+  const [health, nodes, tenants, use, jobs, ad] = await Promise.all([soft(api("/provider/health")), soft(api("/provider/nodes")),
+    soft(api("/provider/tenants")), soft(api(usageQ({since: mtd.since}))), soft(api("/provider/jobs?limit=6")), soft(addonUsage({since: mtd.since}))]);
   const okHub = !failed(health) && health.hub === "ok", okQ = !failed(health) && health.queue === "ok";
-  const byTenant = {};
-  if (!failed(use)) use.lines.forEach(l => byTenant[l.tenant] = (byTenant[l.tenant] || 0) + l.cost);
+  const byTenant = {}, A = addonOk(ad);
+  if (!failed(use)) [...use.lines, ...(A ? A.lines : [])].forEach(l => byTenant[l.tenant] = (byTenant[l.tenant] || 0) + l.cost);
   const ramT = failed(nodes) ? 0 : sum(nodes, n => n.ram_total_mb), ramF = failed(nodes) ? 0 : sum(nodes, n => n.ram_free_mb);
   return html`${pageHead("Provider dashboard", btn("Onboard tenant", "tenant-new", {icon: "add"}))}
   ${!failed(health) && (!okHub || !okQ) ? note(html`<b>Attention:</b> hub ${health.hub}; job queue ${health.queue}.`, "warn") : ""}
@@ -980,7 +1017,8 @@ async function dashProvider() {
       <div><div class="stat">${sum(nodes, n => n.guests)}</div><div class="muted small">guests</div></div>
       <div><div class="stat">${failed(tenants) ? "—" : tenants.length}</div><div class="muted small">tenants</div></div></div>
       <div style="margin-top:12px">${quotaBar("RAM in use (all nodes)", ramT - ramF, ramT, mem)}</div><a class="small" href="#/nodes">Nodes →</a>`}</div>
-    <div class="card"><h2>Revenue</h2><div class="muted small">${mtd.label}, so far</div><div class="stat">${failed(use) ? "—" : money(use.total_cost)}</div>
+    <div class="card"><h2>Revenue</h2><div class="muted small">${mtd.label}, so far</div><div class="stat">${failed(use) ? "—" : money(use.total_cost + addonCost(A))}</div>
+      ${A && !failed(use) ? html`<div class="small muted">VM hours ${money(use.total_cost)} + additional metrics ${money(A.total_cost)}</div>` : ""}
       <div style="margin-top:10px">${hbars(Object.entries(byTenant).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([t, v]) => ({label: t, v, href: "#/tenants/" + enc(t)})))}</div>
       <a class="small" href="#/billing">Billing overview →</a></div>
     <div class="card p0" style="grid-column:1/-1"><div class="ch"><h2>Tenants</h2><a class="small" href="#/tenants">All tenants →</a></div>
@@ -992,11 +1030,13 @@ async function dashProvider() {
 
 async function dashAuditor() {
   const mtd = monthRange(0);
-  const [ev, denied, use, ul] = await Promise.all([soft(api("/audit/events?limit=8")), soft(api("/audit/events?result=denied&limit=8")),
-    soft(api(usageQ({since: mtd.since}))), soft(api("/carrier/underlay"))]);
+  const [ev, denied, use, ul, ad] = await Promise.all([soft(api("/audit/events?limit=8")), soft(api("/audit/events?result=denied&limit=8")),
+    soft(api(usageQ({since: mtd.since}))), soft(api("/carrier/underlay")), soft(addonUsage({since: mtd.since}))]);
+  const A = addonOk(ad);
   return html`${pageHead("Auditor dashboard", "", "Read-only evidence")}
   <div class="grid">
-    <div class="card"><h2>Metered this month</h2><div class="stat">${failed(use) ? "—" : money(use.total_cost)}</div>
+    <div class="card"><h2>Metered this month</h2><div class="stat">${failed(use) ? "—" : money(use.total_cost + addonCost(A))}</div>
+      ${A && !failed(use) ? html`<div class="small muted">VM hours ${money(use.total_cost)} + additional metrics ${money(A.total_cost)}</div>` : ""}
       <div class="muted small">${failed(use) ? use.__error : `${new Set(use.lines.map(l => l.tenant)).size} tenant(s), ${use.lines.length} VM(s)`}</div>
       <a class="small" href="#/billing">Metering →</a></div>
     <div class="card"><h2>Underlay</h2>${failed(ul) ? errorBox(ul.__error) : kv([["Full-MTU path to hub", st(ul.mtu && ul.mtu.ok ? "ok" : "error")],
@@ -1088,6 +1128,7 @@ ACT["console-close"] = async d => { await api(`/tenant/consoles/${enc(d.id)}`, {
 
 async function tunnelsPage() {
   const ts = await api(P.tunnels());
+  if (isProv()) { const vms = await soft(api("/provider/vms")); if (!failed(vms)) { const o = Object.fromEntries(vms.map(v => [v.name, v.tenant])); ts.forEach(t => t.tenant = o[t.vm]); } }
   const me = isCons() ? await api("/tenant/me") : null;
   return html`${pageHead("Tunnels", isCons() ? btn("Publish a port", "tunnel-new", {icon: "add", disabled: me.usage.tunnels >= me.quota.max_tunnels}) : "", "Access")}
     ${note(html`A tunnel publishes one port of a VM on the internet through a Cloudflare quick tunnel (<code>https://…trycloudflare.com</code>).
@@ -1146,10 +1187,12 @@ function flavorCols(edit) {
     edit && {h: "", cls: "act", f: f => html`${ibtn("edit", "flavor-edit", "Edit", {name: f.name})}${ibtn("del", "flavor-del", "Delete", {name: f.name})}`}].filter(Boolean);
 }
 async function flavorsPage() {
-  const fl = await flavors(true);
+  const [fl, defs] = await Promise.all([flavors(true), addonDefs()]);
   return html`${pageHead("Machine types", btn("New machine type", "flavor-edit", {icon: "add"}), "Compute · pricing and rating")}
     ${note("A machine type (flavor) is the size of a VM and its price per running hour. Changing a price affects metering from the next sample on; past usage keeps its price.")}
-    ${tcard("", "", table(flavorCols(true), fl))}`;
+    ${tcard("", "", table(flavorCols(true), fl))}
+    ${defs ? html`${addonPriceTable(defs)}${note(html`Metered by the add-on meter (<code>vdc_meter.py</code>) every ${defs.interval_minutes} min.
+      Its metrics and prices are set in <code>metrics.json</code>; a change applies from the meter's next start, and past samples keep their price.`)}` : ""}`;
 }
 ACT["flavor-edit"] = async d => {
   const f = d.name ? (await flavors()).find(x => x.name === d.name) : {name: "", vcpus: 1, mem_mb: 512, disk_gb: 5, price_per_hour: 0.01};
@@ -1492,30 +1535,39 @@ async function runRate(tenant) {      // cost per hour of the VMs running now (p
 async function billingOverview(_, q) {
   const tenant = isCons() ? null : q.tenant || "";
   const m = monthRange(0), lm = monthRange(-1);
-  const [mtd, last, d30, rr, names] = await Promise.all([usage({since: m.since, tenant}), soft(usage({since: lm.since, until: lm.until, tenant})),
-    soft(costSeries({since: daysAgo(29), tenant})), runRate(tenant), isCons() ? [] : soft(tenantNames())]);
+  const [mtd, last, d30raw, rr, names, aM, aL, a30] = await Promise.all([usage({since: m.since, tenant}), soft(usage({since: lm.since, until: lm.until, tenant})),
+    soft(costSeries({since: daysAgo(29), tenant})), runRate(tenant), isCons() ? [] : soft(tenantNames()),
+    soft(addonUsage({since: m.since, tenant})), soft(addonUsage({since: lm.since, until: lm.until, tenant})), soft(addonUsage({since: daysAgo(30), tenant}))]);
+  const A = addonOk(aM), d30 = withAddonDays(d30raw, a30);
   const elapsedH = (Date.now() - m.start) / 3600000;
   const rateNow = rr ? rr.rate : (elapsedH ? mtd.total_cost / elapsedH : 0);
-  const forecast = mtd.total_cost + rateNow * hoursLeftInMonth();
+  const costNow = mtd.total_cost + addonCost(A);
+  const forecast = costNow + (rateNow + (A ? A.rate_per_hour : 0)) * hoursLeftInMonth();
   const grp = (lines, k) => { const o = {}; lines.forEach(l => o[l[k]] = (o[l[k]] || 0) + l.cost); return Object.entries(o).map(([label, v]) => ({label, v})).sort((a, b) => b.v - a.v); };
+  const both = k => grp([...mtd.lines, ...(A ? A.lines.map(l => ({...l, vm: vmLabel(l.vm)})) : [])], k);
   const pick = isCons() ? "" : html`<select class="inp" style="width:auto" data-change="bill-tenant">
     <option value="">All tenants</option>${failed(names) ? "" : names.map(n => html`<option ${n === tenant ? "selected" : ""}>${n}</option>`)}</select>`;
   return html`${pageHead("Billing overview", html`${pick}${btn("Reports", "go", {icon: "chart", cls: "flat", data: {href: "#/billing/reports"}})}`,
       html`${isCons() ? "Billing for tenant " + S.me.tenant : role() === "auditor" ? "Metering" : "Accounting"}${tenant ? " · " + tenant : ""}`)}
   <div class="grid">
-    <div class="card"><h2>Month to date</h2><div class="muted small">${m.label}</div><div class="stat">${money(mtd.total_cost)}</div>
-      <div class="small muted">${num(sum(mtd.lines, l => l.vm_hours))} VM hours · ${mtd.lines.length} VM(s)</div></div>
+    <div class="card"><h2>Month to date</h2><div class="muted small">${m.label}</div><div class="stat">${money(costNow)}</div>
+      <div class="small muted">${num(sum(mtd.lines, l => l.vm_hours))} VM hours · ${mtd.lines.length} VM(s)</div>
+      ${A ? html`<div class="small muted">VM hours ${money(mtd.total_cost)} + additional metrics ${money(A.total_cost)}</div>` : ""}</div>
     <div class="card"><h2>Forecast</h2><div class="muted small">End of ${m.label}</div><div class="stat">${money(forecast)}</div>
-      <div class="small muted">${rr ? `${rr.running} VM(s) running now at ${rate(rr.rate)}/h` : "at the average rate of this month"}</div>
-      ${isCons() || (isProv() && !tenant) ? budgetBar(forecast, mtd.total_cost) : ""}</div>
-    <div class="card"><h2>Last month</h2><div class="muted small">${lm.label}</div><div class="stat">${failed(last) ? "—" : money(last.total_cost)}</div>
+      <div class="small muted">${rr ? `${rr.running} VM(s) running now at ${rate(rr.rate)}/h` : "at the average rate of this month"}${A ? `, additional metrics ${rate(A.rate_per_hour)}/h` : ""}</div>
+      ${isCons() || (isProv() && !tenant) ? budgetBar(forecast, costNow) : ""}</div>
+    <div class="card"><h2>Last month</h2><div class="muted small">${lm.label}</div><div class="stat">${failed(last) ? "—" : money(last.total_cost + addonCost(aL))}</div>
       <div class="small"><a href="#/billing/invoices/${lm.key}${tenant ? "?tenant=" + enc(tenant) : ""}">View invoice →</a></div></div>
   </div>
   <div class="card" style="margin-top:16px"><h2>Daily cost, last 30 days</h2>${failed(d30) ? errorBox(d30.__error) : costChart(d30)}</div>
   <div class="grid"><div class="card"><h2>${isCons() || tenant ? "Cost by VM" : "Cost by tenant"}, this month</h2>
-      ${hbars((isCons() || tenant ? grp(mtd.lines, "vm") : grp(mtd.lines, "tenant").map(x => ({...x, href: isProv() ? `#/billing?tenant=${enc(x.label)}` : undefined}))).slice(0, 10))}</div>
-    <div class="card"><h2>Cost by machine type, this month</h2>${hbars(grp(mtd.lines, "flavor"))}</div></div>
-  ${note("Metering samples the running VMs every few minutes and charges each sample at its machine type's price per hour. Stopped VMs are not charged.")}`;
+      ${hbars((isCons() || tenant ? both("vm") : both("tenant").map(x => ({...x, href: isProv() ? `#/billing?tenant=${enc(x.label)}` : undefined}))).slice(0, 10))}</div>
+    <div class="card"><h2>VM hours by machine type, this month</h2>${hbars(grp(mtd.lines, "flavor"))}</div>
+    ${A ? html`<div class="card"><h2>Additional metrics, this month</h2>${hbars(A.metrics.map(x => ({label: x.label, v: x.cost})))}
+      <div class="small muted" style="margin-top:6px">${A.metrics.map(x => `${x.label}: ${num(x.quantity, 3)} ${x.unit}`).join(" · ") || "nothing metered yet"}</div>
+      ${isCons() ? html`<a class="small" href="#/billing/pricing">Prices →</a>` : isProv() ? html`<a class="small" href="#/flavors">Prices →</a>` : ""}</div>` : ""}</div>
+  ${note(html`Metering samples the running VMs every few minutes and charges each sample at its machine type's price per hour. Stopped VMs are not charged.
+    ${A ? "The additional metrics are metered by the provider's add-on meter, each at its own price." : ""}`)}`;
 }
 ACT["bill-tenant"] = (d, el) => { const {path} = parseHash(); location.hash = "#" + path + (el.value ? "?tenant=" + enc(el.value) : ""); };
 
@@ -1529,14 +1581,20 @@ function periodOf(q) {
 }
 async function billingReports(_, q) {
   const per = periodOf(q), tenant = isCons() ? null : q.tenant || "", by = q.by || (isCons() || tenant ? "vm" : "tenant");
-  const [r, names, series] = await Promise.all([usage({since: per.since, until: per.until, tenant}), isCons() ? [] : soft(tenantNames()),
-    soft(costSeries({since: per.since, until: per.until, tenant}))]);
+  const [r, names, series0, ar] = await Promise.all([usage({since: per.since, until: per.until, tenant}), isCons() ? [] : soft(tenantNames()),
+    soft(costSeries({since: per.since, until: per.until, tenant})), soft(addonUsage({since: per.since, until: per.until, tenant}))]);
+  const A = addonOk(ar), series = withAddonDays(series0, ar);
+  const ag = {};                                           // add-on lines grouped like the VM lines
+  (A ? A.lines : []).forEach(l => { const k = by === "vm" ? [l.metric, l.tenant, l.vm] : by === "tenant" ? [l.metric, l.tenant] : [l.metric];
+    const g = ag[k.join("\u0000")] || (ag[k.join("\u0000")] = {metric: l.metric, label: l.label, unit: l.unit, tenant: l.tenant, vm: l.vm, quantity: 0, cost: 0});
+    g.quantity += l.quantity; g.cost += l.cost; });
+  const arows = Object.values(ag).sort((a, b) => b.cost - a.cost);
   const groups = {};
   r.lines.forEach(l => { const k = by === "vm" ? `${l.vm}\u0000${l.tenant}` : l[by];
     const g = groups[k] || (groups[k] = {key: by === "vm" ? l.vm : l[by], tenant: l.tenant, flavor: l.flavor, vms: 0, vm_hours: 0, vcpu_hours: 0, ram_gb_hours: 0, cost: 0});
     g.vms++; g.vm_hours += l.vm_hours; g.vcpu_hours += l.vcpu_hours; g.ram_gb_hours += l.ram_gb_hours; g.cost += l.cost; });
-  const rows = Object.values(groups).sort((a, b) => b.cost - a.cost), total = r.total_cost;
-  S.report = {rows, by, per};
+  const rows = Object.values(groups).sort((a, b) => b.cost - a.cost), total = r.total_cost + addonCost(A);
+  S.report = {rows, arows, by, per};
   const set = (k, v) => { const n = {...q, [k]: v}; if (!v) delete n[k]; return "#/billing/reports?" + new URLSearchParams(n); };
   return html`${pageHead("Cost reports", btn("Export CSV", "csv-report", {icon: "download", cls: "flat"}), isCons() ? "Billing" : "Billing · all tenants")}
   <div class="card" style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end">
@@ -1548,7 +1606,8 @@ async function billingReports(_, q) {
     ${isCons() ? "" : html`<div><span class="flabel">Tenant</span><select class="inp" style="width:auto" data-change="bill-tenant">
       <option value="">All tenants</option>${failed(names) ? "" : names.map(n => html`<option ${n === tenant ? "selected" : ""}>${n}</option>`)}</select></div>`}
   </div>
-  <div class="grid"><div class="card"><h2>Total, ${per.label}</h2><div class="stat">${money(total)}</div><div class="small muted">${dt(r.since)} – ${dt(r.until)}</div></div>
+  <div class="grid"><div class="card"><h2>Total, ${per.label}</h2><div class="stat">${money(total)}</div><div class="small muted">${dt(r.since)} – ${dt(r.until)}</div>
+      ${A ? html`<div class="small muted">VM hours ${money(r.total_cost)} + additional metrics ${money(A.total_cost)}</div>` : ""}</div>
     <div class="card"><h2>Usage</h2><div class="stats"><div><div class="stat">${num(sum(r.lines, l => l.vm_hours), 1)}</div><div class="muted small">VM hours</div></div>
       <div><div class="stat">${num(sum(r.lines, l => l.vcpu_hours), 1)}</div><div class="muted small">vCPU hours</div></div>
       <div><div class="stat">${num(sum(r.lines, l => l.ram_gb_hours), 1)}</div><div class="muted small">RAM GB-hours</div></div></div></div></div>
@@ -1557,38 +1616,50 @@ async function billingReports(_, q) {
       by === "vm" && !isCons() && {h: "Tenant", f: g => g.tenant}, by === "vm" && {h: "Machine type", f: g => g.flavor}, by !== "vm" && {h: "VMs", cls: "right", f: g => g.vms},
       {h: "VM hours", cls: "right", f: g => num(g.vm_hours)}, {h: "vCPU hours", cls: "right", f: g => num(g.vcpu_hours)}, {h: "RAM GB-h", cls: "right", f: g => num(g.ram_gb_hours)},
       {h: "Share", cls: "right", f: g => total ? (g.cost / total * 100).toFixed(1) + "%" : "—"}, {h: "Cost", cls: "right", f: g => money(g.cost, 4)}].filter(Boolean), rows,
-      {empty: "No metered usage in this period.", foot: rows.length ? [{v: "Total"}, ...Array((by === "vm" ? (isCons() ? 1 : 2) : 1) + 4).fill({v: ""}), {v: money(total, 4), cls: "right"}] : null}))}`;
+      {empty: "No metered usage in this period.", foot: rows.length ? [{v: "VM hours"}, ...Array((by === "vm" ? (isCons() ? 1 : 2) : 1) + 4).fill({v: ""}), {v: money(r.total_cost, 4), cls: "right"}] : null}))}
+  ${A ? tcard("Additional metrics", "", table([{h: "Metric", f: g => g.label},
+      by !== "flavor" && !isCons() && {h: "Tenant", f: g => g.tenant}, by === "vm" && {h: "VM", f: g => vmLabel(g.vm)},
+      {h: "Quantity", cls: "right", f: g => `${num(g.quantity, 3)} ${g.unit}`},
+      {h: "Rate", cls: "right", f: g => addonRate(g)},
+      {h: "Share", cls: "right", f: g => total ? (g.cost / total * 100).toFixed(1) + "%" : "—"}, {h: "Cost", cls: "right", f: g => money(g.cost, 4)}].filter(Boolean), arows,
+      {empty: "Nothing metered by the add-on in this period.", foot: arows.length ? [{v: "Additional metrics"},
+        ...Array((by === "vm" ? (isCons() ? 1 : 2) : by === "tenant" && !isCons() ? 1 : 0) + 3).fill({v: ""}), {v: money(A.total_cost, 4), cls: "right"}] : null})) : ""}`;
 }
 billingReports.after = () => { const f = $("#cf"); if (f) f.onsubmit = e => { e.preventDefault(); const {q} = parseHash();
   location.hash = "#/billing/reports?" + new URLSearchParams({...q, ...Object.fromEntries(new FormData(f))}); }; };
 ACT["csv-report"] = () => {
-  const {rows, by, per} = S.report;
+  const {rows, arows, by, per} = S.report;
+  const all = [...rows.map(r => ({...r, item: "vm hours", cost: r.cost.toFixed(4)})),
+               ...arows.map(r => ({item: r.label, key: by === "vm" ? r.vm : by === "tenant" ? r.tenant : r.metric, tenant: by === "flavor" ? "" : r.tenant,
+                                   quantity: +r.quantity.toFixed(6), unit: r.unit, cost: r.cost.toFixed(4)}))];
   ACT.dl({file: `vdc-cost-${by}-${per.label.replace(/\W+/g, "-")}.csv`, type: "text/csv",
-    text: csv(["key", "tenant", "flavor", "vms", "vm_hours", "vcpu_hours", "ram_gb_hours", "cost"], rows.map(r => ({...r, cost: r.cost.toFixed(4)})))});
+    text: csv(["item", "key", "tenant", "flavor", "vms", "vm_hours", "vcpu_hours", "ram_gb_hours", "quantity", "unit", "cost"], all)});
 };
 
 async function invoicesPage(_, q) {
   const tenant = isCons() ? S.me.tenant : q.tenant || "";
   const names = isCons() ? [] : await soft(tenantNames());
   const months = [0, -1, -2, -3, -4, -5].map(monthRange);
-  const totals = await Promise.all(months.map(m => soft(usage({since: m.since, until: m.until, tenant: tenant || undefined}))));
+  const [totals, extra] = await Promise.all([Promise.all(months.map(m => soft(usage({since: m.since, until: m.until, tenant: tenant || undefined})))),
+    Promise.all(months.map(m => soft(addonUsage({since: m.since, until: m.until, tenant: tenant || undefined}))))]);
   return html`${pageHead("Invoices", isCons() ? "" : html`<select class="inp" style="width:auto" data-change="bill-tenant"><option value="">All tenants</option>
       ${failed(names) ? "" : names.map(n => html`<option ${n === tenant ? "selected" : ""}>${n}</option>`)}</select>`, "Billing")}
     ${isCons() ? "" : tenant ? "" : note("Showing the sum over all tenants. Choose a tenant for its own invoices.")}
     ${tcard("", "", table([{h: "Invoice", f: x => html`<a href="#/billing/invoices/${x.m.key}${!isCons() && tenant ? "?tenant=" + enc(tenant) : ""}"><b>${invNo(tenant, x.m.key)}</b></a>`},
       {h: "Period", f: x => x.m.label}, {h: "Status", f: x => x.i === 0 ? pill("open (month running)", "warn") : pill("closed", "ok")},
       {h: "VM hours", cls: "right", f: x => failed(x.r) ? "—" : num(sum(x.r.lines, l => l.vm_hours))},
-      {h: "Amount", cls: "right", f: x => failed(x.r) ? html`<span class="small" style="color:var(--err)">${x.r.__error}</span>` : html`<b>${money(x.r.total_cost)}</b>`}],
-      months.map((m, i) => ({m, i, r: totals[i]}))))}`;
+      {h: "Amount", cls: "right", f: x => failed(x.r) ? html`<span class="small" style="color:var(--err)">${x.r.__error}</span>` : html`<b>${money(x.r.total_cost + addonCost(x.a))}</b>`}],
+      months.map((m, i) => ({m, i, r: totals[i], a: extra[i]}))))}`;
 }
 const invNo = (tenant, key) => `INV-${(tenant || "ALL").toUpperCase()}-${key.replace("-", "")}`;
 async function invoiceView({month}, q) {
   if (!/^\d{4}-\d\d$/.test(month)) throw new Error("bad month " + month);
   const tenant = isCons() ? S.me.tenant : q.tenant || "";
   const m = monthOf(month);
-  const [r, info, fl] = await Promise.all([usage({since: m.since, until: m.until, tenant: tenant || undefined}),
+  const [r, info, fl, ax] = await Promise.all([usage({since: m.since, until: m.until, tenant: tenant || undefined}),
     isCons() ? soft(api("/tenant/me")) : isProv() && tenant ? soft(api(`/provider/tenants/${enc(tenant)}`)) : null,
-    role() === "auditor" ? null : soft(flavors())]);
+    role() === "auditor" ? null : soft(flavors()), soft(addonUsage({since: m.since, until: m.until, tenant: tenant || undefined}))]);
+  const A = addonOk(ax), alines = A ? [...A.lines].sort((a, b) => a.tenant.localeCompare(b.tenant) || a.label.localeCompare(b.label) || a.vm.localeCompare(b.vm)) : [];
   const lines = [...r.lines].sort((a, b) => a.tenant.localeCompare(b.tenant) || a.vm.localeCompare(b.vm));
   const open = monthRange(0).key === month;
   const ti = info && !failed(info) ? info : null;
@@ -1608,19 +1679,36 @@ async function invoiceView({month}, q) {
       {h: "Rate / h", cls: "right", f: l => { const f = fl && !failed(fl) ? fl.find(x => x.name === l.flavor) : null;
         return f && Math.abs(f.price_per_hour * l.vm_hours - l.cost) < 0.01 ? rate(f.price_per_hour) : l.vm_hours ? rate(l.cost / l.vm_hours) : "—"; }},
       {h: "Amount", cls: "right", f: l => money(l.cost, 4)}].filter(Boolean), lines,
-      {empty: "No metered usage in this period.", foot: [{v: "Total"}, ...Array(tenant ? 3 : 4).fill({v: ""}), {v: money(r.total_cost), cls: "right"}]})}
+      {empty: "No metered usage in this period.", foot: [{v: A ? "VM hours" : "Total"}, ...Array(tenant ? 3 : 4).fill({v: ""}), {v: money(r.total_cost), cls: "right"}]})}
+    ${A ? html`<h3 style="margin-top:24px">Additional metrics</h3>
+      ${table([!tenant && {h: "Tenant", f: l => l.tenant}, {h: "Item", f: l => l.label}, {h: "VM", f: l => vmLabel(l.vm)},
+        {h: "Quantity", cls: "right", f: l => `${num(l.quantity, 3)} ${l.unit}`},
+        {h: "Rate", cls: "right", f: l => addonRate(l)},
+        {h: "Amount", cls: "right", f: l => money(l.cost, 4)}].filter(Boolean), alines,
+        {empty: "Nothing metered by the add-on in this period.", foot: [{v: "Additional metrics"}, ...Array(tenant ? 3 : 4).fill({v: ""}), {v: money(A.total_cost), cls: "right"}]})}
+      <div class="qrow" style="margin-top:16px;font-size:16px;border-top:2px solid var(--text);padding-top:10px"><b>Total</b><b>${money(r.total_cost + A.total_cost)}</b></div>` : ""}
     <p class="small muted" style="margin-top:24px">Charges are metered: the running VMs are sampled every few minutes and each sample is charged at the
-      machine type's price per hour. Stopped VMs are not charged. Amounts in ${S.cur}.</p>
+      machine type's price per hour. Stopped VMs are not charged.${A ? " Additional metrics are sampled by the provider's add-on meter and charged at their own rates." : ""} Amounts in ${S.cur}.</p>
   </div>`;
 }
 ACT["csv-inv"] = async d => {
-  const m = monthOf(d.month), r = await usage({since: m.since, until: m.until, tenant: d.tenant || undefined});
-  ACT.dl({file: `${invNo(d.tenant, d.month)}.csv`, type: "text/csv", text: csv(["tenant", "vm", "flavor", "vm_hours", "vcpu_hours", "ram_gb_hours", "cost"], r.lines)});
+  const m = monthOf(d.month), [r, a] = await Promise.all([usage({since: m.since, until: m.until, tenant: d.tenant || undefined}),
+    soft(addonUsage({since: m.since, until: m.until, tenant: d.tenant || undefined}))]);
+  const rows = [...r.lines.map(l => ({...l, item: "vm hours"})),
+                ...(addonOk(a) ? a.lines.map(l => ({item: l.label, tenant: l.tenant, vm: l.vm, quantity: l.quantity, unit: l.unit, cost: l.cost})) : [])];
+  ACT.dl({file: `${invNo(d.tenant, d.month)}.csv`, type: "text/csv",
+    text: csv(["item", "tenant", "vm", "flavor", "vm_hours", "vcpu_hours", "ram_gb_hours", "quantity", "unit", "cost"], rows)});
 };
+function addonPriceTable(defs) {
+  return tcard("Additional metrics", "", table([{h: "Metric", f: m => html`<b>${m.label}</b>${m.description ? html`<div class="small muted">${m.description}</div>` : ""}`},
+    {h: "Charged", f: m => m.kind === "amount" ? "per unit used" : m.source === "vm" ? (m.when === "always" ? "while the VM exists" : m.when === "stopped" ? "while the VM is stopped" : "while the VM runs")
+      : m.source === "tenant" ? "per tenant" : m.source === "tunnels" ? "while the tunnel is open" : "as measured"},
+    {h: "Price", cls: "right", f: m => `${rate(m.price)} / ${m.unit}`}], defs.metrics, {empty: "No additional metrics."}));
+}
 async function pricingPage() {
-  const fl = await flavors(true);
-  return html`${pageHead("Pricing", "", "Billing")}${note("The price list of this cloud, set by the provider. You pay per running hour; stopped VMs cost nothing.")}
-    ${tcard("Machine types", "", table(flavorCols(false), fl))}`;
+  const [fl, defs] = await Promise.all([flavors(true), addonDefs()]);
+  return html`${pageHead("Pricing", "", "Billing")}${note("The price list of this cloud, set by the provider. VM hours: you pay per running hour; stopped VMs cost nothing.")}
+    ${tcard("Machine types", "", table(flavorCols(false), fl))}${defs ? addonPriceTable(defs) : ""}`;
 }
 
 /* ================================================================= the pages of each role */

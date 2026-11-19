@@ -1,0 +1,36 @@
+{
+  "api": "http://127.0.0.1:36100",
+  "interval_minutes": 5,
+  "db": "state/meter.db",
+  "metrics": [
+    {
+      "name": "disk",
+      "label": "Disk, allocated",
+      "description": "the machine type's disk, also while the VM is stopped",
+      "source": "vm", "value": "disk_gb", "when": "always",
+      "kind": "gauge", "per": "month", "unit": "GB-month", "price": 0.10
+    },
+    {
+      "name": "tunnels",
+      "label": "Public tunnels",
+      "description": "each open Cloudflare tunnel to a VM",
+      "source": "tunnels",
+      "kind": "gauge", "per": "hour", "unit": "tunnel-hour", "price": 0.01
+    },
+    {
+      "name": "internet",
+      "label": "Internet access",
+      "description": "a tenant whose guests may reach the internet",
+      "source": "tenant", "value": "internet",
+      "kind": "gauge", "per": "hour", "unit": "tenant-hour", "price": 0.002
+    },
+    {
+      "name": "accounts",
+      "label": "Accounts",
+      "description": "each user account of a tenant; a custom metric from examples/accounts.py",
+      "source": "command", "command": "python3 examples/accounts.py",
+      "kind": "gauge", "per": "month", "unit": "account-month", "price": 1.00,
+      "enabled": false
+    }
+  ]
+}
