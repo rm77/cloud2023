@@ -319,7 +319,11 @@ def main():
         with open(a.password_file) as f:
             pw = f.read().strip()
     api = Api(cfg["api"], a.user, pw)
-    api.login()
+    if a.check or a.once:
+        try:
+            api.login()
+        except (urllib.error.URLError, OSError) as e:
+            raise SystemExit(f"vdc-meter: the API at {cfg['api']} does not answer ({getattr(e, 'reason', e)})")
     if a.check:
         rows = sample_once(cfg, api, save=False)
         print(f"{'METRIC':14} {'TENANT':14} {'VM':12} {'VALUE':>10} {'QUANTITY':>12} {'UNIT':14} {'COST':>10}")
@@ -336,7 +340,7 @@ def main():
             rows = sample_once(cfg, api)
             print(f"{iso(utcnow())} sampled {len(rows)} value(s), {sum(r[-1] for r in rows):.6f}", flush=True)
         except (urllib.error.URLError, OSError) as e:        # the API is down: try again next round
-            print(f"{iso(utcnow())} API not reachable: {e}", flush=True)
+            print(f"{iso(utcnow())} API not reachable: {getattr(e, 'reason', e)}", flush=True)
         if a.once:
             break
         time.sleep(max(1, cfg["interval_minutes"] * 60 - (time.time() - t0)))

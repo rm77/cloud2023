@@ -72,7 +72,7 @@ class MeterTest(unittest.TestCase):
             m["enabled"] = True                                    # the example command too
         cfg["metrics"] += [
             {"name": "vcpu", "source": "vm", "value": "vcpus", "when": "running", "per": "hour", "price": 0.004},
-            {"name": "traffic", "source": "command", "kind": "amount", "unit": "GB", "price": 0.05,
+            {"name": "volume", "source": "command", "kind": "amount", "unit": "GB", "price": 0.05,
              "command": "echo 'tenant-a a1 2.5'; echo '# a comment'; echo 'tenant-b b1 1'"},
             {"name": "broken", "source": "command", "command": "exit 3"}]
         cls.cfg_path = os.path.join(cls.tmp, "metrics.json")
@@ -126,7 +126,7 @@ class MeterTest(unittest.TestCase):
         self.assertEqual(got[("accounts", "tenant-a", "-")][0], 2)
         self.assertEqual(got[("accounts", "tenant-b", "-")][0], 1)
         # an amount is charged as it is, not over time
-        self.assertEqual(got[("traffic", "tenant-a", "a1")], (2.5, 2.5, 2.5 * 0.05))
+        self.assertEqual(got[("volume", "tenant-a", "a1")], (2.5, 2.5, 2.5 * 0.05))
         # a failing metric is logged and the rest still counted
         self.assertTrue(any("broken" in x for x in logs))
 
@@ -137,7 +137,7 @@ class MeterTest(unittest.TestCase):
         r = M.report(self.cfg, now - timedelta(hours=1), now + timedelta(minutes=1))
         disk_a1 = next(l for l in r["lines"] if (l["metric"], l["vm"]) == ("disk", "a1"))
         self.assertAlmostEqual(disk_a1["cost"], round(2 * 5 * (5 / 60) / 730 * 0.10, 4))
-        traffic = next(m for m in r["metrics"] if m["metric"] == "traffic")
+        traffic = next(m for m in r["metrics"] if m["metric"] == "volume")
         self.assertEqual((traffic["quantity"], traffic["unit"]), (7.0, "GB"))
         self.assertAlmostEqual(r["total_cost"], round(sum(l["cost"] for l in r["lines"]), 4), places=3)
         # gauges only in the rate: tunnels 3*0.01 + internet 0.002 + accounts 3/730 + vcpu 2*0.004 + disk 12*0.1/730

@@ -15,7 +15,8 @@ It is separate from the kit and changes nothing in it: it uses the API's endpoin
 | `vdc-passwd.sh` | sets the password of any API account, the provider's own included (main PC, root) |
 | `vdc_meter.py` | meters additional billing metrics through the API, at your own prices |
 | `metrics.json` | the metrics `vdc_meter.py` measures and their prices |
-| `examples/accounts.py` | a custom metric: user accounts per tenant |
+| `examples/accounts.py` | a custom metric from the API: user accounts per tenant |
+| `examples/traffic.sh` | a custom metric from the cluster's command line: network traffic per VM |
 | `test_meter.py` | tests for `vdc_meter.py` and the console's `/addon/` calls: `python3 test_meter.py` |
 
 ## Running it
@@ -185,10 +186,25 @@ login in `VDC_API` and `VDC_TOKEN`, so it can ask the API for anything the provi
 `examples/accounts.py` counts each tenant's user accounts (`/provider/users`) and is in
 `metrics.json` as the metric `accounts` (switched off; set `"enabled": true`).
 
-A command can measure things outside the API too, for example traffic counters from the nodes,
-with `"kind": "amount"`: then VALUE is what was used since the last round (GB, say), charged at
-`price` per unit. A command that fails is logged and that round skips it; the other metrics are
-still metered.
+A command can also take its numbers from the cluster's command line, outside the API. With
+`"kind": "amount"`, VALUE is what was used since the last round (GB, say), charged at `price`
+per unit. `examples/traffic.sh` does this for network traffic, as the metric `traffic` in
+`metrics.json` (switched off):
+
+- it asks the hub `hubctl vms` (which guest is on which node, for which tenant), then each node
+  `virsh domstats --interface` (the guests' byte counters, through `hubctl exec NODE`);
+- it reaches the hub with SSH and the kit's own key (`state/id_lab`, `HUB_IP` from
+  `cluster.conf`), so the meter has to run as root on the main PC;
+- it keeps the counters of the last round in `state/traffic.last` and prints the difference:
+  the first round only records them, a counter that went down (the guest restarted) counts from
+  zero, and a node that does not answer is charged once it answers again.
+
+To use it, set the kit folder in its command and switch it on:
+`"command": "sh examples/traffic.sh /home/<you>/vdc-cluster", "enabled": true`. The same way
+works for any other number a node can give: `virsh domstats --block` for the disk space a guest
+really uses, `--vcpu` for CPU time.
+
+A command that fails is logged and that round skips it; the other metrics are still metered.
 
 Prices: each sample keeps the price it was charged at, so a new price in `metrics.json` applies
 from the meter's next start, and past charges stay as they were.

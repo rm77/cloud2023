@@ -7,29 +7,56 @@
       "name": "disk",
       "label": "Disk, allocated",
       "description": "the machine type's disk, also while the VM is stopped",
-      "source": "vm", "value": "disk_gb", "when": "always",
-      "kind": "gauge", "per": "month", "unit": "GB-month", "price": 0.10
+      "source": "vm",
+      "value": "disk_gb",
+      "when": "always",
+      "kind": "gauge",
+      "per": "month",
+      "unit": "GB-month",
+      "price": 0.1
     },
     {
       "name": "tunnels",
       "label": "Public tunnels",
       "description": "each open Cloudflare tunnel to a VM",
       "source": "tunnels",
-      "kind": "gauge", "per": "hour", "unit": "tunnel-hour", "price": 0.01
+      "kind": "gauge",
+      "per": "hour",
+      "unit": "tunnel-hour",
+      "price": 0.01
     },
     {
       "name": "internet",
       "label": "Internet access",
       "description": "a tenant whose guests may reach the internet",
-      "source": "tenant", "value": "internet",
-      "kind": "gauge", "per": "hour", "unit": "tenant-hour", "price": 0.002
+      "source": "tenant",
+      "value": "internet",
+      "kind": "gauge",
+      "per": "hour",
+      "unit": "tenant-hour",
+      "price": 0.002
     },
     {
       "name": "accounts",
       "label": "Accounts",
       "description": "each user account of a tenant; a custom metric from examples/accounts.py",
-      "source": "command", "command": "python3 examples/accounts.py",
-      "kind": "gauge", "per": "month", "unit": "account-month", "price": 1.00,
+      "source": "command",
+      "command": "python3 examples/accounts.py",
+      "kind": "gauge",
+      "per": "month",
+      "unit": "account-month",
+      "price": 1.0,
+      "enabled": false
+    },
+    {
+      "name": "traffic",
+      "label": "Network traffic",
+      "description": "GB received and sent by each VM; a custom metric from the cluster's command line (examples/traffic.sh)",
+      "source": "command",
+      "command": "sh examples/traffic.sh /path/to/vdc-cluster",
+      "kind": "amount",
+      "unit": "GB",
+      "price": 0.05,
       "enabled": false
     }
   ]
